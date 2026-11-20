@@ -1,0 +1,46 @@
+# summary: Photos in Docker: loopback port (default 9556) for a reverse proxy with HTTPS in front; every machine-specific value comes from .env (see .env.example).
+# The library is mounted read-write only so Delete can move a photo to the app's trash (restorable for 30 days);
+# nothing else is ever written there. Add :ro to the library volume for a strictly read-only library.
+services:
+  photos:
+    image: ${PHOTOS_IMAGE:-ghcr.io/ricardopsantos/negative:latest}   # ready-built; --build builds from this folder instead
+    build: .
+    pull_policy: missing
+    container_name: ${PHOTOS_CONTAINER:-photos}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PHOTOS_PORT:-9556}:9556"
+    environment:
+      TZ: ${TZ:-UTC}
+      PHOTOS_DATA_DIR: /app/data
+      PHOTOS_BROWSE_ROOT: /library
+      PHOTOS_DEFAULT_ALBUMS: ${PHOTOS_DEFAULT_ALBUMS:-}   # comma list of folders (relative to the library), picked once at first start
+      PHOTOS_ALLOWED_HOSTS: ${PHOTOS_ALLOWED_HOSTS:-localhost,127.0.0.1}
+      PHOTOS_EMAIL: ${PHOTOS_EMAIL:-admin@photos.local}
+      PHOTOS_NAME: ${PHOTOS_NAME:-}
+      PHOTOS_PASSWORD: ${PHOTOS_PASSWORD:-}   # unset = the login screen creates the user on first run
+      PHOTOS_FACES: ${PHOTOS_FACES:-1}   # 0 = no face detection (People)
+      PHOTOS_CLIP: ${PHOTOS_CLIP:-1}     # 0 = no smart search by words
+    volumes:
+      - ${PHOTOS_LIBRARY:?set PHOTOS_LIBRARY in .env (the folder with your photos)}:/library
+      - ${PHOTOS_DATA:-./data}:/app/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,uid=1000,gid=1000,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: ${PHOTOS_MEMORY:-2g}
+    cpus: ${PHOTOS_CPUS:-2}   # face detection, thumbnails and ffmpeg stay inside this
+    pids_limit: 256
+    healthcheck:         # a hung gunicorn shows as unhealthy instead of "up"
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:9556/healthz', timeout=8)"]
+      interval: 60s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    logging:             # one access-log line per thumbnail: cap it
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

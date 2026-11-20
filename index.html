@@ -1,0 +1,441 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Negative</title>
+<link rel="icon" type="image/png" href="/favicon.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#2c68a6">
+<link rel="apple-touch-icon" href="/icon-192.png">
+<style>
+/* Flavour 1 Desktop, layout 1 shell (Web App Design Language v1.23): tokens copied unchanged */
+:root{
+  color-scheme: light dark;
+  --bg:#edeef0; --panel:#f6f7f8; --view:#fff; --fg:#1f2328; --dim:#5d6675; --line:#c9ccd1;
+  --hover:#dfe6ee; --btn:#fbfbfc; --accent:#2c68a6; --accent-fg:#fff; --sel:#2c68a6; --sel-fg:#fff;
+  --ok:#2a7347; --warn:#9c4d00; --bad:#b3261e;
+  --cat-1:#2a66b0; --cat-2:#6f42b5; --cat-3:#0b6e6e; --cat-4:#a3327e; --cat-5:#6b6100; --cat-6:#7a4f3a;
+  --shadow:0 6px 24px rgba(0,0,0,.25);
+  --fs-body:13px; --r-sm:3px; --r-md:4px; --r-lg:6px;
+  --sp-half:8px; --sp:16px; --sp-2x:32px; --sp-4x:64px;
+  --fs-secondary:12px; --fs-caption:11px; --fs-title:16px;
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", "DejaVu Sans", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+  --tile:160px;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#2b2d31; --panel:#303338; --view:#1f2124; --fg:#e4e6ea; --dim:#a6aebb; --line:#45484e;
+  --hover:#3a3f47; --btn:#3a3d43; --accent:#6aa6e0; --accent-fg:#10151b; --sel:#2c5f96; --sel-fg:#fff;
+  --ok:#8fd08f; --warn:#e6a55a; --bad:#ef8b84;
+  --cat-1:#7fb2ee; --cat-2:#b79df0; --cat-3:#5fd0d0; --cat-4:#f08fc8; --cat-5:#cfc35a; --cat-6:#d9a58a;
+}}
+:root[data-theme="dark"]{color-scheme:dark;
+  --bg:#2b2d31; --panel:#303338; --view:#1f2124; --fg:#e4e6ea; --dim:#a6aebb; --line:#45484e;
+  --hover:#3a3f47; --btn:#3a3d43; --accent:#6aa6e0; --accent-fg:#10151b; --sel:#2c5f96; --sel-fg:#fff;
+  --ok:#8fd08f; --warn:#e6a55a; --bad:#ef8b84;
+  --cat-1:#7fb2ee; --cat-2:#b79df0; --cat-3:#5fd0d0; --cat-4:#f08fc8; --cat-5:#cfc35a; --cat-6:#d9a58a;
+}
+:root[data-theme="light"]{color-scheme:light}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{font-family:var(--font-sans);font-size:var(--fs-body);line-height:1.35;background:var(--bg);color:var(--fg);display:flex;flex-direction:column;overflow:hidden}
+button,select,input{font:inherit;color:inherit}
+button{background:var(--btn);border:1px solid var(--line);border-radius:var(--r-md);padding:4px 12px;min-width:72px;cursor:pointer;font-weight:500}
+button:hover{background:var(--hover)}
+button.primary{background:var(--accent);color:var(--accent-fg);border-color:var(--accent);font-weight:600}
+button.danger{background:var(--bad);color:var(--accent-fg);border-color:var(--bad);font-weight:600}
+button:disabled{background:var(--line);color:var(--dim);cursor:not-allowed}
+button.icon{min-width:28px;width:28px;height:28px;padding:0;display:inline-flex;align-items:center;justify-content:center;font-size:16px;line-height:1}
+:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+input,select{background:var(--view);border:1px solid var(--line);border-radius:var(--r-sm);padding:4px 8px;min-width:0;max-width:100%}
+/* header bar */
+header{display:flex;align-items:center;gap:var(--sp-half);background:var(--panel);border-bottom:1px solid var(--line);padding:var(--sp-half) var(--sp);flex-wrap:wrap}
+.dot{width:10px;height:10px;border-radius:50%;background:var(--accent)}
+.brand{font-size:var(--fs-title);font-weight:600;letter-spacing:0}
+.spacer{flex:1}
+/* body: side pane + main view + scrubber */
+#body{flex:1;display:flex;min-height:0;position:relative}
+nav{width:240px;background:var(--panel);border-right:1px solid var(--line);overflow-y:auto;padding:var(--sp-half);display:flex;flex-direction:column;gap:var(--sp-half);flex:none}
+.cap{font-size:var(--fs-caption);text-transform:uppercase;letter-spacing:.08em;color:var(--dim);padding:var(--sp-half) var(--sp-half) 0}
+.item{display:flex;align-items:center;gap:var(--sp-half);padding:4px 8px;border-radius:var(--r-sm);cursor:pointer;font-weight:500;min-width:0}
+.item:hover{background:var(--hover)}
+.item.sel{background:var(--sel);color:var(--sel-fg)}
+.item .n{margin-left:auto;font-size:var(--fs-secondary);color:var(--dim);font-weight:400}
+.item.sel .n{color:var(--sel-fg)}
+.item .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+main{flex:1;min-width:0;overflow-y:auto;background:var(--view);position:relative;scroll-behavior:auto}
+main.dropping{outline:3px dashed var(--accent,#3b82f6);outline-offset:-6px}
+#grid{padding:var(--sp)}
+.month{margin-bottom:var(--sp)}
+.month h3{font-size:var(--fs-body);font-weight:600;color:var(--dim);padding-bottom:var(--sp-half);position:sticky;top:0;background:var(--view);z-index:10}
+.tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--tile),1fr));gap:var(--sp-half)}
+.tile{position:relative;aspect-ratio:1;background:var(--panel);border-radius:var(--r-sm);overflow:hidden;cursor:pointer;border:0;padding:0;min-width:0}
+.tile img{width:100%;height:100%;object-fit:cover;display:block}
+.tile video.hv{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;pointer-events:none;background:var(--panel)}
+.tile .badge{position:absolute;right:4px;bottom:4px;background:var(--panel);color:var(--fg);border-radius:var(--r-sm);padding:0 4px;font-size:var(--fs-caption)}
+.tile.sel{outline:3px solid var(--accent);outline-offset:-3px}
+.tile.sel::after{content:"\2713";position:absolute;right:4px;top:4px;background:var(--accent);color:var(--accent-fg);border-radius:50%;width:20px;height:20px;line-height:20px;text-align:center;font-size:13px}
+#selbar{font-size:var(--fs-secondary)}
+.tile .star{position:absolute;left:4px;top:4px;color:var(--warn);font-size:16px;text-shadow:0 0 2px var(--view)}
+.vid{display:flex;align-items:center;justify-content:center;height:100%;color:var(--dim);font-size:24px}
+.vnote{position:absolute;left:0;right:0;bottom:64px;text-align:center;color:#fff;font-size:14px;text-shadow:0 1px 2px #000;padding:8px 16px}
+#rail{width:64px;flex:none;overflow-y:auto;background:var(--view);border-left:1px solid var(--line);padding:var(--sp-half) 0;text-align:center;font-size:var(--fs-caption);color:var(--dim)}
+#rail a{display:block;padding:4px 0;cursor:pointer}
+#rail a:hover{background:var(--hover);color:var(--fg)}
+#rail a.y{font-weight:600;color:var(--fg)}
+footer{background:var(--panel);border-top:1px solid var(--line);padding:4px var(--sp);font-size:var(--fs-secondary);color:var(--dim)}
+.empty{padding:var(--sp-2x);color:var(--dim);text-align:center}
+/* dialogs */
+dialog{margin:auto;background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:var(--r-lg);padding:var(--sp);box-shadow:var(--shadow);max-width:min(560px,calc(100vw - var(--sp-2x)))}
+dialog::backdrop{background:rgba(0,0,0,.5)}
+dialog .bar{display:flex;gap:var(--sp-half);justify-content:flex-end;margin-top:var(--sp)}
+dialog h2{font-size:var(--fs-title);font-weight:600;margin-bottom:var(--sp-half)}
+dialog .row{display:flex;flex-direction:column;gap:var(--sp-half)}
+#viewer{max-width:100vw;width:100vw;height:100dvh;max-height:100dvh;border:0;border-radius:0;padding:0;background:#000;color:#fff}
+#viewer .stage{position:absolute;inset:52px 0 0 0;display:flex;align-items:center;justify-content:center}
+#viewer .stage img,#viewer .stage video{max-width:100%;max-height:100%;object-fit:contain}
+#viewer .vbar{position:absolute;left:0;right:0;bottom:0;height:44px;background:var(--panel);color:var(--fg);display:flex;align-items:center;gap:var(--sp-half);padding:0 var(--sp);border-top:1px solid var(--line)}
+#viewer .vbar .name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#viewer .nav{position:absolute;top:50%;transform:translateY(-50%);background:var(--panel);opacity:.85}
+#tagbar{position:absolute;left:0;right:0;top:56px;text-align:center;z-index:6;pointer-events:none}
+#tagbar span{background:var(--accent);color:var(--accent-fg);padding:4px 12px;border-radius:999px}
+#viewer.tagging .stage img{cursor:crosshair}
+#taglist{max-height:50vh;overflow:auto;margin-top:var(--sp-half);display:flex;flex-direction:column;gap:2px;min-width:260px}
+#taglist button{display:flex;align-items:center;gap:8px;text-align:left;padding:4px 8px}
+#taglist img{width:32px;height:32px;border-radius:50%;object-fit:cover;background:var(--panel)}
+#vppl{position:absolute;left:0;right:0;bottom:var(--sp);display:flex;flex-wrap:wrap;justify-content:center;gap:var(--sp-half);z-index:4;pointer-events:none}
+#vppl button{pointer-events:auto;display:flex;align-items:center;gap:6px;background:rgba(0,0,0,.65);color:#fff;border:1px solid rgba(255,255,255,.35);border-radius:999px;padding:3px 12px 3px 3px}
+#vppl button{touch-action:manipulation;-webkit-touch-callout:none;user-select:none}
+#vppl img{width:28px;height:28px;border-radius:50%;object-fit:cover}
+#viewer .prev{left:var(--sp-half)} #viewer .next{right:var(--sp-half)}
+.path{font-family:var(--font-mono);font-size:var(--fs-secondary);color:var(--dim);overflow-wrap:anywhere}
+.crumbs{display:flex;gap:var(--sp-half);align-items:center}
+#tree{max-height:50vh;overflow:auto;background:var(--view);border:1px solid var(--line);border-radius:var(--r-sm);padding:4px}
+.tr{display:flex;align-items:center;gap:var(--sp-half);padding:4px 8px;border-radius:var(--r-sm)}
+.tr:hover{background:var(--hover)}
+.tr .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}
+.albrow{display:flex;align-items:center;gap:var(--sp-half);padding:4px 8px;border-radius:var(--r-sm)}
+.albrow .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.albrow .path{font-size:var(--fs-caption)}
+.tag{font-size:var(--fs-caption);color:var(--ok);font-weight:600}
+[hidden]{display:none!important}
+dialog label{display:flex;flex-direction:column;gap:4px;font-size:var(--fs-secondary);color:var(--dim)}
+dialog label input,dialog label select{width:100%;box-sizing:border-box;color:var(--fg)}
+#login{width:min(380px,calc(100vw - var(--sp-2x)));padding:var(--sp-2x)}
+#login form{display:flex;flex-direction:column;align-items:stretch;gap:var(--sp)}
+#login .brand{display:flex;flex-direction:column;align-items:center;gap:var(--sp-half);margin-bottom:var(--sp-half)}
+#login .brand img{width:48px;height:48px}
+#login .sub{color:var(--dim);font-size:var(--fs-secondary);text-align:center}
+#login h2{text-align:center;margin:0}
+#login label{display:flex;flex-direction:column;gap:4px;font-size:var(--fs-secondary);color:var(--dim)}
+#login input{width:100%;box-sizing:border-box;font-size:var(--fs-body);color:var(--fg)}
+#login button{width:100%}
+#login .err{text-align:center;min-height:1.35em;margin:0}
+.err{color:var(--bad);min-height:1.35em}
+@media (max-width:768px){
+  :root{--tile:100px}
+  nav{position:absolute;z-index:30;left:0;top:0;bottom:0;transform:translateX(-100%);transition:transform .15s;box-shadow:var(--shadow)}
+  nav.open{transform:none}
+  .tiles{grid-template-columns:repeat(3,minmax(0,1fr))}
+  #rail{width:32px}
+  button,input,select{min-height:44px} input,select{font-size:16px}
+  button.icon{min-width:44px;width:44px;height:44px}
+}
+
+/* menu bar */
+.menubar{display:flex;gap:2px;align-items:center}
+.mb{position:relative}
+.mb>button{min-width:0;background:transparent;border-color:transparent;padding:2px 10px;font-weight:500}
+.mb>button:hover,.mb.open>button{background:var(--hover);border-color:var(--line)}
+.mnu{position:absolute;left:0;top:100%;min-width:220px;background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);box-shadow:var(--shadow);padding:4px;z-index:100;display:none}
+.mb.open .mnu{display:block}
+.mnu button{display:flex;width:100%;min-width:0;text-align:left;background:transparent;border-color:transparent;padding:4px 8px;gap:var(--sp);justify-content:space-between;font-weight:400}
+.mnu button:hover:not(:disabled){background:var(--sel);color:var(--sel-fg)}
+.mnu button:disabled{background:transparent;color:var(--dim);opacity:.6}
+.mnu .k{color:var(--dim);font-size:var(--fs-caption)}
+.mnu button:hover:not(:disabled) .k{color:var(--sel-fg)}
+.mnu hr{border:0;border-top:1px solid var(--line);margin:4px 0}
+#viewer .vtop{position:absolute;left:0;right:0;top:0;min-height:44px;background:var(--panel);color:var(--fg);display:flex;align-items:center;gap:var(--sp-half);padding:4px var(--sp);border-bottom:1px solid var(--line);flex-wrap:wrap;z-index:5}
+#viewer .vtop .name{flex:1;min-width:80px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#viewer .stage{inset:52px 0 0 0;overflow:auto}
+#viewer.full .stage{align-items:flex-start;justify-content:flex-start}
+#viewer.full .stage img{max-width:none;max-height:none;flex:none}
+#viewer .stage img.turn{transition:none}
+#infoBody{max-height:65vh;overflow:auto;min-width:min(520px,80vw)}
+#info{max-width:min(720px,calc(100vw - var(--sp-2x)))}
+#infoBody h3{font-size:var(--fs-body);margin:var(--sp-half) 0 4px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em;font-size:var(--fs-caption)}
+table.kv{border-collapse:collapse;width:100%;table-layout:fixed}
+table.kv td{padding:2px 8px 2px 0;vertical-align:top;border-bottom:1px solid var(--line);font-size:var(--fs-secondary)}
+table.kv td:first-child{color:var(--dim);width:170px;overflow-wrap:anywhere}
+table.kv td:last-child{overflow-wrap:anywhere;font-family:var(--font-mono)}
+
+.pbar{display:flex;gap:var(--sp-half);align-items:center;flex-wrap:wrap;margin-bottom:var(--sp)}
+.pbar .pface{width:40px;height:40px;border-radius:50%;object-fit:cover}
+.people{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:var(--sp)}
+.pcard{display:flex;flex-direction:column;align-items:center;gap:4px;text-align:center}
+.pcard img{width:120px;height:120px;border-radius:50%;object-fit:cover;cursor:pointer;background:var(--panel)}
+.pcard input{width:100%;text-align:center}
+.searchf,#searchf{margin:0}
+#search{width:min(26ch,40vw)}
+.toast{position:fixed;left:50%;bottom:var(--sp);transform:translateX(-50%);display:flex;gap:var(--sp);align-items:center;padding:var(--sp-half) var(--sp);background:var(--panel);border:1px solid var(--line);border-radius:var(--r-lg);z-index:50}
+.suggest,.fcheck{margin-bottom:var(--sp)}
+.suggest h3{margin:0 0 var(--sp-half)}
+.sg{display:flex;gap:var(--sp-half);align-items:center;flex-wrap:wrap;margin-bottom:var(--sp-half)}
+.sg img{width:48px;height:48px;border-radius:50%;object-fit:cover}
+.chips{display:flex;flex-wrap:wrap;gap:var(--sp-half);margin-bottom:var(--sp-half)}
+.chip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:999px;padding:2px 10px 2px 2px}
+.chip img{width:32px;height:32px;border-radius:50%;object-fit:cover}
+.chip a{cursor:pointer;color:var(--accent)}
+button.link{background:none;border:0;min-width:0;padding:0 4px;color:var(--dim);font-size:var(--fs-caption);text-decoration:underline}
+
+.xsec{margin-bottom:var(--sp-2x)}
+.xhead{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:var(--sp-half)}
+.xhead h3{font-size:var(--fs-title);font-weight:600}
+.more{color:var(--accent);cursor:pointer}
+.xrow{display:flex;gap:var(--sp);overflow-x:auto;padding-bottom:var(--sp-half)}
+.xcard{position:relative;flex:none;width:200px;height:150px;border-radius:var(--r-md);overflow:hidden;cursor:pointer;background:var(--panel)}
+.xcard img{width:100%;height:100%;object-fit:cover;display:block}
+.xcard .xl{position:absolute;left:0;right:0;bottom:0;padding:6px 10px;color:#fff;background:linear-gradient(transparent,rgba(0,0,0,.7));display:flex;flex-direction:column;font-size:var(--fs-secondary)}
+.xcard .xl b{font-size:var(--fs-body)}
+.xperson{flex:none;width:96px;display:flex;flex-direction:column;align-items:center;gap:4px;cursor:pointer;text-align:center}
+.xperson img{width:84px;height:84px;border-radius:50%;object-fit:cover;background:var(--panel)}
+.xperson span{max-width:96px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* review 2026-11-07 */
+a.item{color:inherit;text-decoration:none}
+.item.drag{opacity:.4} .item.dropto{box-shadow:inset 0 2px 0 var(--accent)}
+.tile:focus-visible{outline:3px solid var(--accent);outline-offset:-3px}
+.tile .broken{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;height:100%;color:var(--dim);font-size:var(--fs-caption);text-align:center;padding:4px}
+.tile .broken b{font-size:22px;color:var(--bad)}
+.tile{-webkit-touch-callout:none;user-select:none}
+#viewer .nav{background:rgba(0,0,0,.55);color:#fff;border:1px solid rgba(255,255,255,.4);border-radius:50%;opacity:1;min-width:44px;width:44px;height:44px;font-size:28px;z-index:6}
+#viewer .nav:hover{background:rgba(0,0,0,.75)}
+#viewer .stage{touch-action:none}
+#viewer .stage img.zoomed{max-width:none;max-height:none;transform-origin:0 0}
+#lockind{font-size:var(--fs-secondary);display:inline-flex;align-items:center;gap:4px}
+#lockind button{min-width:0;padding:2px 8px}
+#upbar{display:flex;align-items:center;gap:var(--sp-half);font-size:var(--fs-secondary)}
+#upbar progress{width:120px}
+.compact{display:none}
+#fmt2row{display:none}
+.toast{max-width:calc(100vw - 32px);flex-wrap:wrap}
+.toast button{min-width:0}
+#ask p{white-space:pre-line;margin-bottom:var(--sp-half)}
+#ask input{width:100%}
+.railtip{position:fixed;right:72px;background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:4px 10px;font-weight:600;z-index:40;pointer-events:none;box-shadow:var(--shadow)}
+#rail{touch-action:none;user-select:none}
+#map{height:calc(100dvh - 180px);min-height:320px;border:1px solid var(--line);border-radius:var(--r-md);background:#aad3df}
+:root[data-theme="dark"] #map{background:#1d3340}
+.leaflet-container{font-family:var(--font-sans)}
+.mappop img{width:160px;height:120px;object-fit:cover;display:block;border-radius:var(--r-sm);margin-bottom:6px}
+.mapdot{background:var(--accent);border:2px solid #fff;border-radius:50%;width:12px;height:12px}
+.stats table{border-collapse:collapse;width:100%;margin-bottom:var(--sp)}
+.stats td,.stats th{border-bottom:1px solid var(--line);padding:4px 8px;text-align:left;font-size:var(--fs-secondary)}
+.stats td.r,.stats th.r{text-align:right;font-variant-numeric:tabular-nums}
+.stats h3{margin:var(--sp) 0 var(--sp-half)}
+.stats .bar{height:8px;background:var(--line);border-radius:4px;overflow:hidden;min-width:120px}
+.stats .bar span{display:block;height:100%;background:var(--accent)}
+.trashitem{position:relative}
+.trashitem input[type=checkbox]{position:absolute;left:6px;top:6px;width:20px;height:20px;min-height:0;z-index:2}
+.trashitem.sel .tile{outline:3px solid var(--accent);outline-offset:-3px}
+.albrow img{width:40px;height:40px;object-fit:cover;border-radius:var(--r-sm);background:var(--view);flex:none}
+.albrow input.rn{flex:1;min-width:0}
+.sg input[type=checkbox]{width:20px;height:20px;min-height:0}
+#slide{position:absolute;left:50%;transform:translateX(-50%);bottom:60px;z-index:7;display:flex;gap:8px;align-items:center;background:rgba(0,0,0,.6);color:#fff;padding:4px 12px;border-radius:999px;font-size:var(--fs-secondary)}
+#slide select,#slide button{min-height:0;background:rgba(255,255,255,.15);color:#fff;border-color:rgba(255,255,255,.35)}
+@media (max-width:768px){
+  header .brand,header .dot{display:none}
+  #mbMain,#mbView,#rescan,#selmode,header #fmt,.vfull{display:none!important}
+  .compact{display:inline-flex}
+  #fmt2row{display:block;padding:0 var(--sp-half)}
+  #fmt2row select{width:100%}
+  header{flex-wrap:nowrap}
+  #search{width:100%;min-width:0}
+  #searchf{flex:1;min-width:96px}
+  #lockind span{display:none}  /* the Lock button alone on a phone: the search box keeps its room */
+  #viewer .vtop{flex-wrap:nowrap}
+  #viewer .vtop .name{min-width:0}
+  .mnu.wide{left:auto;right:0;max-height:70vh;overflow:auto}
+  .railtip{right:40px}
+}
+.mnu .head{font-size:var(--fs-caption);text-transform:uppercase;letter-spacing:.08em;color:var(--dim);padding:6px 8px 2px}
+/* PH90: the PIN is typed on a number pad, like a phone lock screen */
+#pinDlg{width:min(340px,calc(100vw - 32px))}
+#pinIn{position:absolute;opacity:0;pointer-events:none;width:1px;height:1px}
+#pinDots{display:flex;justify-content:center;gap:12px;min-height:20px;margin:8px 0}
+#pinDots span{width:14px;height:14px;border-radius:50%;border:2px solid var(--fg)}
+#pinDots span.on{background:var(--fg)}
+#pinPad{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;justify-items:center}
+#pinPad button{width:72px;height:72px;min-width:0;border-radius:50%;font-size:26px;font-weight:500;padding:0}
+#pinPad button.primary{font-size:28px}
+/* Design Language v1.25: a select draws its own arrow, 12 px from the border */
+select:not([multiple]):not([size]){appearance:none;-webkit-appearance:none;padding-right:32px;background-repeat:no-repeat;background-size:5px 6px;background-position:right 17px center,right 12px center;background-image:linear-gradient(to top right,transparent 50%,currentColor 50%),linear-gradient(to top left,transparent 50%,currentColor 50%)}
+/* the same arrow where an id rule sets its own padding and background */
+#slide select{padding-right:32px;background-repeat:no-repeat;background-size:5px 6px;background-position:right 17px center,right 12px center;background-image:linear-gradient(to top right,transparent 50%,currentColor 50%),linear-gradient(to top left,transparent 50%,currentColor 50%)}
+</style>
+</head>
+<body>
+<header>
+  <button class="icon" id="menu" title="Albums" aria-label="Albums">&#9776;</button>
+  <span class="dot"></span><span class="brand">Negative</span>
+  <div class="menubar" id="mbMain"></div>
+  <span class="spacer"></span>
+  <form id="searchf" role="search"><input id="search" type="search" placeholder="Search: beach, sunset, snow..." aria-label="Search photos by what is in them" autocomplete="off"></form>
+  <span id="selbar" hidden><span id="selcount"></span> <button class="danger" id="seldel">Delete</button> <button id="selclear">Clear</button></span>
+  <span id="lockind" hidden></span>
+  <span id="upbar" hidden><span id="uptext"></span><progress id="upprog" max="1" value="0"></progress><button id="upcancel">Cancel</button></span>
+  <button id="upload" title="Upload photos and videos from this device into the upload album">Upload</button>
+  <input id="upfiles" type="file" accept="image/*,video/*,.heic,.heif" multiple hidden>
+  <button id="selmode" title="Pick several photos (or Ctrl/Cmd-click, Shift-click a range)">Select</button>
+  <button id="rescan" title="Look for new, changed and removed photos in all folders">Rescan folders</button>
+  <select id="fmt" title="Filter by format" aria-label="Filter by format"><option value="">All formats</option></select>
+  <div class="menubar compact" id="mbCompact"></div>
+</header>
+<div id="body">
+  <nav id="side">
+    <div id="fmt2row"><select id="fmt2" aria-label="Filter by format"><option value="">All formats</option></select></div>
+    <div class="cap">Library</div>
+    <div id="lib"></div>
+    <div class="cap" id="albcap" style="cursor:pointer" title="Create, rename, remove albums; choose the upload album. Drag albums to reorder them.">Albums (folders) &middot; Manage</div>
+    <div id="albums"></div>
+  </nav>
+  <main id="main"><div id="grid"></div></main>
+  <div id="rail" aria-label="Timeline"></div>
+</div>
+<footer id="status">&nbsp;</footer>
+
+<dialog id="login"><form method="dialog" class="row" id="loginForm">
+  <div class="brand"><img src="/favicon.png" alt=""><h2>Negative</h2><div class="sub" id="loginSub"></div></div>
+  <label>Email<input id="email" type="email" autocomplete="username" required></label>
+  <label>Password<input id="pw" type="password" autocomplete="current-password" required></label>
+  <label id="pw2row" hidden>Repeat password<input id="pw2" type="password" autocomplete="new-password"></label>
+  <label id="pinrow" hidden>PIN for Hidden photos (4 to 12 digits, optional)<input id="pinsetup" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="12" autocomplete="off" placeholder="Empty = 12341234"></label>
+  <div class="err" id="loginErr" role="alert"></div>
+  <button class="primary" id="loginBtn" type="submit">Sign in</button>
+</form></dialog>
+
+<dialog id="qrDlg"><div class="row">
+  <h2>Sign in on another device</h2>
+  <div id="qrImg" style="background:#fff;padding:8px;border-radius:8px;width:260px;margin:auto"></div>
+  <div class="path">Scan with the phone camera. Works once, for 5 minutes.</div>
+  <div class="path">For the Immich iPhone app, enter this server address and sign in with your email and password:<br><b id="qrSrv"></b></div>
+  <div class="bar"><button id="qrNo">Close</button></div>
+</div></dialog>
+<dialog id="pinDlg"><form method="dialog" class="row" id="pinForm">
+  <h2 id="pinTitle">Hidden photos</h2>
+  <div class="path" id="pinWhy"></div>
+  <input id="pinIn" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="12" autocomplete="off" required aria-label="PIN" readonly>
+  <div id="pinDots" aria-hidden="true"></div>
+  <div class="err" id="pinErr" role="alert"></div>
+  <div id="pinPad" role="group" aria-label="PIN keypad">
+    <button type="button" data-d="1">1</button><button type="button" data-d="2">2</button><button type="button" data-d="3">3</button>
+    <button type="button" data-d="4">4</button><button type="button" data-d="5">5</button><button type="button" data-d="6">6</button>
+    <button type="button" data-d="7">7</button><button type="button" data-d="8">8</button><button type="button" data-d="9">9</button>
+    <button type="button" data-d="back" aria-label="Delete last digit">&#9003;</button><button type="button" data-d="0">0</button><button type="submit" class="primary" aria-label="Open">&#10003;</button>
+  </div>
+  <div class="bar"><button type="button" class="link" id="pinForgot">Forgot the PIN?</button><span class="spacer"></span><button type="button" id="pinNo">Cancel</button></div>
+</form>
+<form method="dialog" class="row" id="pinResetForm" hidden>
+  <h2>Choose a new PIN</h2>
+  <div class="path">Sign-in password instead of the old PIN.</div>
+  <label>Account password<input id="prPw" type="password" autocomplete="current-password" required></label>
+  <label>New PIN (4 to 12 digits)<input id="prNew" type="password" inputmode="numeric" pattern="[0-9]{4,12}" maxlength="12" autocomplete="off" required></label>
+  <div class="err" id="prErr" role="alert"></div>
+  <div class="bar"><button type="button" id="prBack">Back</button><button class="primary" type="submit">Set PIN and open</button></div>
+</form></dialog>
+<dialog id="pinChg"><form method="dialog" class="row" id="pinChgForm">
+  <h2>Change the Hidden photos PIN</h2>
+  <label>Current PIN<input id="pcCur" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="12" autocomplete="off" required></label>
+  <label>New PIN (4 to 12 digits)<input id="pcNew" type="password" inputmode="numeric" pattern="[0-9]{4,12}" maxlength="12" autocomplete="off" required></label>
+  <label>Repeat new PIN<input id="pcNew2" type="password" inputmode="numeric" pattern="[0-9]{4,12}" maxlength="12" autocomplete="off" required></label>
+  <div class="err" id="pcErr" role="alert"></div>
+  <div class="bar"><button type="button" id="pcNo">Cancel</button><button class="primary" type="submit">Change PIN</button></div>
+</form></dialog>
+
+<dialog id="viewer" aria-label="Photo">
+  <div class="vtop">
+    <div class="menubar" id="mbView"></div>
+    <span class="name" id="vname"></span>
+    <button id="vlive" hidden title="Play the Live Photo (L)">Live</button>
+    <button class="icon vfull" id="vrl" aria-label="Rotate left" title="Rotate left (Shift+R)">&#10226;</button>
+    <button class="icon vfull" id="vrr" aria-label="Rotate right" title="Rotate right (R)">&#10227;</button>
+    <button class="vfull" id="vfit" title="Fit to screen or show at full size (F)">Full size</button>
+    <button class="icon" id="vfav" aria-label="Favorite" title="Favorite">&#9734;</button>
+    <button class="vfull" id="vdown" title="Download the original file">Download</button>
+    <button class="vfull" id="vhid" title="Hide this photo (needs the PIN to see it again)">Hide</button>
+    <button class="vfull" id="vtag" title="Tag a person who already has a name (T)">Tag</button>
+    <button class="vfull" id="vinfo" title="Info (I)">Info</button>
+    <button class="vfull" id="vconv">Convert</button>
+    <button class="danger" id="vdel">Delete</button>
+    <div class="menubar compact" id="mbVCompact"></div>
+    <button id="vclose">Close</button>
+  </div>
+  <div id="slide" hidden><span id="slidest">Slideshow</span><select id="slidedelay" aria-label="Seconds per photo"><option value="3">3 s</option><option value="5">5 s</option><option value="10">10 s</option></select><button id="slideshuf" aria-pressed="false">Shuffle</button><button id="slidepause">Pause</button><button id="slidestop">Stop</button></div>
+  <div class="stage" id="stage"></div>
+  <div id="vppl" hidden></div>
+  <div id="tagbar" hidden></div>
+  <button class="icon nav prev" id="prev" aria-label="Previous">&#8249;</button>
+  <button class="icon nav next" id="next" aria-label="Next">&#8250;</button>
+</dialog>
+
+<dialog id="confirm"><h2>Delete this photo?</h2>
+  <div class="path" id="cpath"></div>
+  <p style="margin-top:var(--sp-half)">It moves to the trash and disappears from its folder (and from any device that syncs that folder). You can restore it for 30 days.</p>
+  <div class="bar"><button id="cno">Cancel</button><button class="danger" id="cyes">Delete</button></div>
+</dialog>
+
+<dialog id="convd"><h2>Convert</h2>
+  <div class="path" id="cvname"></div>
+  <form class="row" id="cvform" style="margin-top:var(--sp-half)">
+    <label>Action<select id="cvop"></select></label>
+    <label id="cvq">JPG quality (%)<input id="cvquality" type="number" min="1" max="100" value="85"></label>
+    <label id="cvp">Percent (%)<input id="cvpercent" type="number" min="1" max="400" value="50"></label>
+    <label id="cvw">Width (px, optional)<input id="cvwidth" type="number" min="1"></label>
+    <label id="cvh">Height (px, optional)<input id="cvheight" type="number" min="1"></label>
+    <div class="path">Creates a new file next to the original. The original is never changed.</div>
+    <div id="cvprog" class="path"></div>
+    <div class="err" id="cverr" role="alert"></div>
+    <div class="bar"><button type="button" id="cvclose">Close</button><button class="primary" id="cvgo" type="submit">Convert</button></div>
+  </form></dialog>
+
+<dialog id="tagd"><h2>Tag a person</h2>
+  <input id="tagq" placeholder="Search names" autocomplete="off" aria-label="Search names">
+  <div id="taglist"></div>
+  <div class="bar"><button id="tagno">Cancel</button></div></dialog>
+
+<dialog id="ask"><form method="dialog" class="row" id="askForm">
+  <h2 id="askTitle"></h2><p id="askMsg"></p>
+  <input id="askIn" autocomplete="off" hidden>
+  <div class="err" id="askErr" role="alert"></div>
+  <div class="bar"><button type="button" id="askNo">Cancel</button><button class="primary" type="submit" id="askYes">OK</button></div>
+</form></dialog>
+
+<dialog id="info"><h2>Info</h2><div id="infoBody"></div><div class="bar"><button id="iclose">Close</button></div></dialog>
+
+<dialog id="keys"><h2>Keyboard shortcuts</h2>
+  <table class="kv"><tr><td>&larr; &rarr;</td><td>Previous / next photo</td></tr><tr><td>F</td><td>Fit / full size</td></tr>
+  <tr><td>R, Shift+R</td><td>Rotate right / left</td></tr><tr><td>T</td><td>Tag a person</td></tr><tr><td>I</td><td>Info</td></tr><tr><td>L</td><td>Play the Live Photo</td></tr><tr><td>S</td><td>Slideshow from this photo</td></tr><tr><td>Space</td><td>Pause / play the slideshow</td></tr><tr><td>Arrow keys</td><td>Move between photos in the grid</td></tr><tr><td>Esc</td><td>Close</td></tr></table>
+  <div class="bar"><button id="kclose">Close</button></div></dialog>
+
+<dialog id="picker"><h2>Add folder</h2>
+  <p style="margin-bottom:var(--sp-half)">Pick a folder. It becomes an album with every photo in it and in its subfolders. Your files are not copied or moved.</p>
+  <div class="crumbs"><button class="icon" id="up" aria-label="Up">&#8593;</button><span class="path" id="here"></span></div>
+  <div id="tree" style="margin-top:var(--sp-half)"></div>
+  <div class="bar"><button id="pclose">Close</button></div>
+</dialog>
+
+<dialog id="albd"><h2>Albums</h2>
+  <p style="margin-bottom:var(--sp-half)">An album is a folder. Removing one only takes it off this list: no photo or folder is deleted. The upload album is where uploads and drops land; it opens with the PIN. Type a new name and press Enter to rename; the arrows change the order.</p>
+  <div id="alblist"></div>
+  <div class="bar"><button id="albnew">New album...</button><button id="albadd">Add existing folder...</button><button id="albclose">Close</button></div>
+</dialog>
+
+<dialog id="aboutd"><h2>About</h2>
+  <p><b>Negative</b>: a self-hosted photo server that works with the Immich phone app. Your folders stay where they are; a picked folder is an album.</p>
+  <p class="path" style="margin-top:var(--sp-half)">Design Language v1.23, flavour 1 Desktop (shell)</p>
+  <div class="bar"><button id="aclose">Close</button></div>
+</dialog>
+
+<script src="/app.js"></script>
+</body>
+</html>
