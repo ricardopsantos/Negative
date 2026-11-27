@@ -1,6 +1,6 @@
 # Third-party parts
 
-Negative's own code is MIT (see [LICENSE](LICENSE)). It uses the parts below, each under its own license.
+Negative's own code is MIT (see [LICENSE](LICENSE)). It uses the parts below, each under its own license. Thanks and the relation to Immich: [CREDITS.md](CREDITS.md).
 
 ## Shipped in this repository
 
@@ -8,6 +8,7 @@ Negative's own code is MIT (see [LICENSE](LICENSE)). It uses the parts below, ea
 |---|---|---|
 | [Leaflet](https://leafletjs.com) 1.9.4 | `vendor/leaflet.js`, `vendor/leaflet.css` | BSD-2-Clause, `vendor/LICENSE-leaflet` |
 | [Leaflet.markercluster](https://github.com/Leaflet/Leaflet.markercluster) 1.5.3 | `vendor/leaflet.markercluster.js`, `vendor/MarkerCluster*.css` | MIT, `vendor/LICENSE-markercluster` |
+| [ThumbHash](https://github.com/evanw/thumbhash) (ported) | `thumbhash.py` (encoder) and the decoder in `app.js` | MIT, `vendor/LICENSE-thumbhash` |
 | [Natural Earth](https://www.naturalearthdata.com) 1:110m admin-0 countries v5.1.2 | `vendor/world.json` (geometry only, rounded) | Public domain |
 
 ## Downloaded when the Docker image is built (not in this repository)

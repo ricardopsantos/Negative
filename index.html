@@ -24,6 +24,7 @@
   --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
   --tile:160px;
 }
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
 @media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
   --bg:#2b2d31; --panel:#303338; --view:#1f2124; --fg:#e4e6ea; --dim:#a6aebb; --line:#45484e;
   --hover:#3a3f47; --btn:#3a3d43; --accent:#6aa6e0; --accent-fg:#10151b; --sel:#2c5f96; --sel-fg:#fff;
@@ -72,6 +73,15 @@ main.dropping{outline:3px dashed var(--accent,#3b82f6);outline-offset:-6px}
 .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--tile),1fr));gap:var(--sp-half)}
 .tile{position:relative;aspect-ratio:1;background:var(--panel);border-radius:var(--r-sm);overflow:hidden;cursor:pointer;border:0;padding:0;min-width:0}
 .tile img{width:100%;height:100%;object-fit:cover;display:block}
+.tile{background-size:cover;background-position:center}
+.tiles.just{display:flex;flex-wrap:wrap}
+.tiles.just .tile{aspect-ratio:auto;flex:none}
+.seg{display:inline-flex;gap:2px}
+.seg button[aria-pressed="true"],.pextra button[aria-pressed="true"]{background:var(--accent);color:var(--accent-fg)}
+.pextra{display:inline-flex;gap:var(--sp-half);align-items:center;flex-wrap:wrap}
+#mapdates{display:inline-flex;gap:var(--sp-half);align-items:center;flex-wrap:wrap}
+#viewer.idle #slide,#viewer.idle .nav{opacity:0;transition:opacity .4s;pointer-events:none}
+#viewer.idle{cursor:none}
 .tile video.hv{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;pointer-events:none;background:var(--panel)}
 .tile .badge{position:absolute;right:4px;bottom:4px;background:var(--panel);color:var(--fg);border-radius:var(--r-sm);padding:0 4px;font-size:var(--fs-caption)}
 .tile.sel{outline:3px solid var(--accent);outline-offset:-3px}

@@ -226,7 +226,7 @@ def test_map(client, auth, lib):
         s.db().execute("INSERT OR REPLACE INTO geo VALUES(?,?,?,?,?,?,?)", (a["id"], 0, 38.72, -9.14, "Lisbon", "", "PT"))
         s.db().commit()
     m = client.get("/ui/map", headers=auth).get_json()
-    assert m == {"id": [a["id"]], "lat": [38.72], "lon": [-9.14]}
+    assert {k: m[k] for k in ("id", "lat", "lon")} == {"id": [a["id"]], "lat": [38.72], "lon": [-9.14]} and len(m["day"]) == 1  # PH120 adds "day"
     bk = client.get("/api/timeline/buckets?bbox=38,-10,39,-9", headers=auth).get_json()
     assert sum(x["count"] for x in bk) == 1
 

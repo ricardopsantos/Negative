@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import secrets
+import tempfile
 from pathlib import Path
 
 from PIL import Image, ImageOps
@@ -177,17 +178,21 @@ def convert_video(src: Path, op: str, p: dict, work: Path, progress) -> Path:
     cmd += ["-c:v", "libx264", "-crf", "22", "-preset", "fast", "-pix_fmt", "yuv420p", "-threads", "4", "-c:a", "aac",
             "-b:a", "160k", "-movflags", "+faststart+use_metadata_tags", "-progress", "pipe:1", str(tmp)]
     total = _duration(src)
-    pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    # PH97: stderr goes to a file, not a pipe: a damaged video prints a line per bad frame, and a full stderr pipe
+    # (64 KB) that nobody reads while we read stdout stops ffmpeg for good, holding the app's one transcode slot.
+    errf = tempfile.TemporaryFile(dir=work)
+    pr = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf, text=True)
     try:
         for line in pr.stdout:
             m = re.match(r"out_time_us=(\d+)", line)
             if m and total:
                 progress(min(99, int(int(m.group(1)) / 1e6 / total * 100)))
-        err = pr.stderr.read()
         if pr.wait() != 0 or not tmp.exists() or tmp.stat().st_size == 0:
-            raise OSError("ffmpeg failed: " + err.strip()[-300:])
+            errf.seek(max(0, os.fstat(errf.fileno()).st_size - 2000))
+            raise OSError("ffmpeg failed: " + errf.read().decode(errors="replace").strip()[-300:])
         return _publish(tmp, src, _suffix(op, p) if op != "vid_mp4" else "", ".mp4")
     finally:
         if pr.poll() is None:
             pr.kill()
+        errf.close()
         tmp.unlink(missing_ok=True)

@@ -7,6 +7,7 @@ import hmac
 import io
 import ipaddress
 import json
+import math
 import mimetypes
 import shutil
 import os
@@ -37,8 +38,9 @@ import clip as clipmod
 import faces
 import yaml
 import places
+import thumbhash
 
-VERSION = "0.1.0"  # Negative's own version (CHANGELOG.md); hand-maintained, bumped for each public release
+VERSION = "0.2.0"  # Negative's own version (CHANGELOG.md); hand-maintained, bumped for each public release
 IMMICH_VERSION = (3, 3, 6)  # the API we mimic (docs/immich-openapi-v3.3.6.json)
 NS = uuid.UUID("6f1d7a52-0c7e-4b8e-9f1a-5e0b1c2d3e4f")
 IMAGE_EXT = {".jpg", ".jpeg", ".jpe", ".jfif", ".png", ".heic", ".heif", ".avif", ".webp", ".gif", ".tif", ".tiff", ".bmp"}
@@ -103,6 +105,7 @@ CREATE TABLE IF NOT EXISTS face_not(face_id INTEGER, person_id TEXT, PRIMARY KEY
 CREATE TABLE IF NOT EXISTS clip(asset_id TEXT PRIMARY KEY, mtime REAL, emb BLOB);
 CREATE TABLE IF NOT EXISTS merge_no(src TEXT, dst TEXT, PRIMARY KEY(src, dst));
 CREATE TABLE IF NOT EXISTS face_manual(face_id INTEGER PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS thumbhash(key TEXT PRIMARY KEY, h TEXT);
 CREATE TABLE IF NOT EXISTS sessions(hash TEXT PRIMARY KEY, id TEXT UNIQUE, first REAL, used REAL, agent TEXT);
 CREATE INDEX IF NOT EXISTS assets_taken ON assets(taken);
 CREATE INDEX IF NOT EXISTS assets_folder_taken ON assets(folder_id, taken);
@@ -144,12 +147,21 @@ def connect():
     c = sqlite3.connect(path, timeout=30)
     c.row_factory = sqlite3.Row
     c.create_function("in_upload", 1, _in_upload, deterministic=True)
+    # PH101: queries test the upload folder as a path range; these bounds are constant within a statement, so SQLite
+    # computes them once instead of calling into Python for every row ("" .. "" = an empty range when there is none)
+    c.create_function("upl_lo", 0, _upload_prefix, deterministic=True)
+    c.create_function("upl_hi", 0, lambda: (_upload_prefix()[:-1] + "0") if _upload_prefix() else "", deterministic=True)
     if str(path) not in _schema_done:
         c.execute("PRAGMA journal_mode=WAL")
         c.executescript(SCHEMA)
         for col in ("ver INTEGER DEFAULT 0", "duration REAL", "sha1 TEXT", "date_src TEXT", "added REAL"):  # added after the first release
             try:
                 c.execute("ALTER TABLE assets ADD COLUMN " + col)
+            except sqlite3.OperationalError:
+                pass
+        for col in ("birth TEXT", "fav INTEGER DEFAULT 0"):  # PH121: a person's birthday and favorite mark
+            try:
+                c.execute("ALTER TABLE persons ADD COLUMN " + col)
             except sqlite3.OperationalError:
                 pass
         c.execute("UPDATE assets SET added=mtime WHERE added IS NULL")  # PH70: rows from before 'added' arrived when their file did
@@ -183,6 +195,22 @@ def _is_private(addr):
 _DOCKER_NET = ipaddress.ip_network("172.16.0.0/12")
 
 
+def _default_gateway():
+    """The container's default-route gateway (the address a loopback-published port arrives from), '' if unknown. PH95."""
+    try:
+        with open("/proc/net/route") as f:
+            for line in f.readlines()[1:]:
+                p = line.split()
+                if len(p) > 2 and p[1] == "00000000" and int(p[3], 16) & 2:
+                    return str(ipaddress.ip_address(int(p[2], 16).to_bytes(4, "little")))
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+_GATEWAY = _default_gateway()
+
+
 def _is_trusted_proxy(addr):
     """PH92: X-Forwarded-For is believed only from this host (loopback) or the Docker bridge gateway that a loopback-published
     port arrives from. A LAN address (192.168.x) is not our proxy and must not choose the address that gets logged or limited."""
@@ -190,7 +218,7 @@ def _is_trusted_proxy(addr):
         ip = ipaddress.ip_address(addr)
     except ValueError:
         return False
-    return ip.is_loopback or ip in _DOCKER_NET
+    return ip.is_loopback or ip in _DOCKER_NET or (bool(_GATEWAY) and addr == _GATEWAY)
 
 
 def client_ip():
@@ -358,6 +386,17 @@ def gate():
         return jsonify(message="Invalid user token", error="Unauthorized", statusCode=401), 401
 
 
+@app.before_request
+def json_object_body():
+    """PH109: every JSON body this app reads is an object. Any other JSON ("x", 1, [..]) went past the handlers'
+    `get_json(silent=True) or {}` and crashed on .get(): a 500 from 24 routes. It is a 400 now, after the login check."""
+    if request.method in ("POST", "PUT", "PATCH", "DELETE") and request.is_json:
+        b = request.get_json(silent=True)
+        if b is not None and not isinstance(b, dict):
+            return err("The body must be a JSON object", 400, "Bad Request")
+    return None
+
+
 def authlog(what):
     """One line per failed attempt in DATA_DIR/auth.log for fail2ban: 'photos-auth FAIL ip=1.2.3.4 what=login'."""
     try:
@@ -477,6 +516,17 @@ def set_pin(pin):
     salt = secrets.token_bytes(16)
     db().execute("INSERT OR REPLACE INTO settings VALUES('pin', ?)", (salt + _scrypt(pin, salt),))
     db().commit()
+    _lock_others()
+
+
+def _lock_others():
+    """PH112: a new PIN (or the default again) locks every other unlocked session at once. The PIN is changed because
+    someone else may know it, and an unlock slides with use (UNLOCK_SECS), so theirs would otherwise stay open for good.
+    The session that changed it proved the PIN or the password just now and stays as it was."""
+    mine = _tok_hash()
+    with _lock:
+        for h in [h for h in _unlocked if h != mine]:
+            _unlocked.pop(h, None)
 
 
 def _proven(b):
@@ -545,6 +595,7 @@ def pin_reset():
         return err("Wrong PIN or password", 400, "Bad Request")
     db().execute("DELETE FROM settings WHERE k='pin'")
     db().commit()
+    _lock_others()
     return "", 204
 
 
@@ -559,6 +610,8 @@ def auth_status():
 @app.post("/ui/hide")
 def ui_hide():
     b = request.get_json(silent=True) or {}
+    if not isinstance(b.get("hidden", False), bool):  # PH126: "false" as text hid the photo
+        return err("hidden must be true or false", 400, "Bad Request")
     set_hidden(_asset(b.get("id", "")), bool(b.get("hidden")))  # un-hiding needs the album unlocked (see _asset)
     return jsonify(ok=True)
 
@@ -670,50 +723,99 @@ def sha_of(path):
     return h.hexdigest()
 
 
+_fav_memo = {}  # PH125: favorites.json's stamp -> its paths
+
+
 def fav_paths():
-    return {v["path"] for v in fav_load().values()}
+    """The favorite paths. PH125: parsed again only when favorites.json changes (it was read and parsed for every
+    month of the timeline, every count and every list)."""
+    f = data_dir() / "favorites.json"
+    try:
+        st = f.stat()
+        stamp = (str(f), st.st_mtime_ns, st.st_size, st.st_ino)
+    except OSError:
+        return set()
+    if _fav_memo.get("stamp") != stamp:
+        _fav_memo.update(stamp=stamp, paths=frozenset(v["path"] for v in fav_load().values()))
+    return set(_fav_memo["paths"])
 
 
 _fav_lock = threading.RLock()  # favorites.json / hidden.json are read-modify-written from several threads
 HASH_INLINE_MAX = 64 << 20  # bigger files (videos) are hashed in a background thread, not inside the request
 
 
-def _hash_later(name, key, path):
+_hashing: set = set()  # (file name, pending key) being hashed right now
+
+
+def _free_key(d, sha):
+    """PH116: the key for a file with this content. Byte-identical files (a copy in two albums) share a hash: the second
+    gets sha#1, sha#2..., where it used to replace the first's entry and so un-mark it."""
+    key, i = sha, 1
+    while key in d:
+        key, i = f"{sha}#{i}", i + 1
+    return key
+
+
+def _hash_later(name, items):
+    """Re-key [(pending key, path)] by content hash in one background thread, one file after another (a bulk mark of
+    a thousand videos must not start a thousand threads reading one disk). A file still missing keeps its pending key:
+    it stays marked by path (fav_relink leaves pending entries alone)."""
+    with _lock:
+        items = [(k, p) for k, p in items if (name, k) not in _hashing]  # PH116: a rescan does not queue it twice
+        _hashing.update((name, k) for k, _ in items)
+
     def run():
-        try:
-            sha = sha_of(path)
-        except OSError:
-            return
-        with _fav_lock:
-            d = fav_load(name)
-            if key in d and sha not in d:
-                d[sha] = d.pop(key)
-                fav_save(d, name)
+        for key, path in items:
+            try:
+                sha = sha_of(path)
+            except OSError:
+                continue
+            finally:
+                with _lock:
+                    _hashing.discard((name, key))
+            with _fav_lock:
+                d = fav_load(name)
+                if key in d:
+                    d[_free_key(d, sha)] = d.pop(key)
+                    fav_save(d, name)
+    if not items:
+        return
     if app.config.get("TESTING"):
         return run()
     threading.Thread(target=run, daemon=True).start()
 
 
-def _mark(name, a, on):
-    """Add or remove one file in favorites.json / hidden.json, keyed by its content hash (survives renames)."""
-    later = None
+def _mark(name, assets, on):
+    """Add or remove files in favorites.json / hidden.json, keyed by content hash (survives renames).
+    PH115: one read and one write of the file for the whole list (it was rewritten once per id: 500 favorites from the
+    phone took 6 s), and the files are hashed before the lock is taken, inline only up to HASH_INLINE_MAX bytes in all;
+    the rest are hashed in the background, so a bulk mark cannot outlive gunicorn's timeout and kill the only worker.
+    PH113: a file missing right now (disk unplugged, PH93) is marked by path and hashed later, not a 500."""
+    assets = list({a["path"]: a for a in assets}.values())  # an id sent twice is hashed once
+    paths = {a["path"] for a in assets}
+    keys, later, budget = {}, [], HASH_INLINE_MAX
+    for a in assets if on else ():
+        size = a["size"] or 0
+        if size <= budget:
+            try:
+                keys[a["path"]] = sha_of(a["path"])
+                budget -= size
+                continue
+            except OSError:
+                pass
+        keys[a["path"]] = "pending:" + a["id"]
+        later.append((keys[a["path"]], a["path"]))
     with _fav_lock:
-        d = fav_load(name)
-        for k in [k for k, v in d.items() if v["path"] == a["path"]]:
-            del d[k]
-        if on:
-            if (a["size"] or 0) <= HASH_INLINE_MAX:
-                key = sha_of(a["path"])
-            else:
-                key = later = "pending:" + a["id"]
-            d[key] = dict(path=a["path"], name=a["name"], size=a["size"])
+        d = {k: v for k, v in fav_load(name).items() if v["path"] not in paths}
+        for a in assets if on else ():
+            k = keys[a["path"]]
+            d[k if k.startswith("pending:") else _free_key(d, k)] = dict(path=a["path"], name=a["name"], size=a["size"])
         fav_save(d, name)
-    if later:
-        _hash_later(name, later, a["path"])
+    _hash_later(name, later)
 
 
 def set_favorite(a, on):
-    _mark("favorites.json", a, on)
+    _mark("favorites.json", [a], on)
 
 
 def _forget_marks(path):
@@ -728,34 +830,55 @@ def _forget_marks(path):
 
 def fav_relink(c, name="favorites.json"):
     """A favorite whose file moved/renamed inside the library is found again by size + content hash.
-    Each lost entry is searched once per change in the number of same-size files, not on every scan."""
+    Each lost entry is searched once per change in the number of same-size files, not on every scan.
+    PH116: an entry still keyed "pending:" (its file was missing when marked, PH113) is hashed once the file is back;
+    a candidate missing right now is skipped (it raised out of the scan's hidden_sync)."""
+    rehash = []
     with _fav_lock:
         d = fav_load(name)
         known = {r["path"] for r in c.execute("SELECT path FROM assets")}
+        marked = {v["path"] for v in d.values()}
         changed = False
-        for sha, v in list(d.items()):
-            if v["path"] in known or sha.startswith("pending:"):
+        for key, v in list(d.items()):
+            if key.startswith("pending:"):
+                if v["path"] in known and os.path.isfile(v["path"]):
+                    rehash.append((key, v["path"]))
+                continue
+            if v["path"] in known:
                 continue
             cands = c.execute("SELECT path FROM assets WHERE size=?", (v["size"],)).fetchall()
             if v.get("tried") == len(cands):
                 continue
             v["tried"], changed = len(cands), True
             for r in cands:
-                if r["path"] not in {x["path"] for x in d.values()} and sha_of(r["path"]) == sha:
+                if r["path"] in marked:
+                    continue
+                try:
+                    same = sha_of(r["path"]) == key.split("#", 1)[0]
+                except OSError:
+                    continue
+                if same:
+                    marked.discard(v["path"])
+                    marked.add(r["path"])
                     v["path"], v["name"] = r["path"], Path(r["path"]).name
                     v.pop("tried", None)
                     break
         if changed:
             fav_save(d, name)
+    _hash_later(name, rehash)
 
 
 # ---- hidden photos: same durable JSON as favorites (hidden.json) + a table the queries filter on ----
 def set_hidden(a, on):
-    _mark("hidden.json", a, on)
+    set_hidden_many([a], on)
+
+
+def set_hidden_many(assets, on):
+    _mark("hidden.json", assets, on)
     if on:
-        db().execute("INSERT OR IGNORE INTO hidden VALUES(?)", (a["path"],))
+        db().executemany("INSERT OR IGNORE INTO hidden VALUES(?)", [(a["path"],) for a in assets])
     else:
-        db().execute("DELETE FROM hidden WHERE path=?", (a["path"],))
+        db().executemany("DELETE FROM hidden WHERE path=?", [(a["path"],) for a in assets])
     db().commit()
 
 
@@ -818,10 +941,14 @@ def video_frame(p: Path, size: int):
     raise OSError("no frame")
 
 
-INDEX_VER = 3  # bump when read_meta changes what it stores: every file is read again on the next scan (3: PH68 dates from names)
+INDEX_VER = 4  # 4: PH126 day-and-month folder names ("2011 - 17 Set - Trip"); bump when read_meta changes what it stores: every file is read again on the next scan (3: PH68 dates from names)
 
 _DATE_FULL = re.compile(r"(?<!\d)(19[5-9]\d|20[0-4]\d)[-_.]?(0[1-9]|1[0-2])[-_.]?(0[1-9]|[12]\d|3[01])"
                         r"(?:[-_ T.]{0,4}(?:at[ _])?([01]\d|2[0-3])[-_.:h]?([0-5]\d)[-_.:m]?([0-5]\d))?(?!\d)")
+_MON = {m: i + 1 for i, names in enumerate(("jan", "feb fev", "mar", "apr abr", "may mai", "jun", "jul", "aug ago",
+                                             "sep set", "oct out", "nov", "dec dez")) for m in names.split()}
+# PH126: "2011 - 17 Set - Trip", "2011-17 Sep", "2011 17 September" (Portuguese or English month, 3 letters or more)
+_DATE_DAYMON = re.compile(r"(?<!\d)(19[5-9]\d|20[0-4]\d)\s*[-_.]?\s*(0?[1-9]|[12]\d|3[01])\s*[-_.]?\s*([A-Za-z]{3})[A-Za-z]*(?![A-Za-z])")
 _DATE_MONTH = re.compile(r"(?<!\d)(19[5-9]\d|20[0-4]\d)[-_. ](0[1-9]|1[0-2])(?!\d)")
 _DATE_YEAR = re.compile(r"(?<![\d])(19[5-9]\d|20[0-4]\d)(?![\d])")
 
@@ -858,6 +985,9 @@ def name_date(p: Path, mtime: float):
         m = _DATE_FULL.search(n)
         if m and ok(*m.groups()[:3]):
             return ok(*m.groups()[:3]), "folder"
+        m = _DATE_DAYMON.search(n)
+        if m and m.group(3).lower() in _MON and ok(m.group(1), _MON[m.group(3).lower()], m.group(2)):
+            return ok(m.group(1), _MON[m.group(3).lower()], m.group(2)), "folder"
         m = _DATE_MONTH.search(n)
         if m:
             y, mo = m.groups()
@@ -925,7 +1055,7 @@ LIVE_VIDEO_MAX_BYTES = int(cfg("PHOTOS_LIVE_VIDEO_MAX_MB", "40")) * 1024 * 1024 
 LIVE_CLIP = "id NOT IN (SELECT video_id FROM live)"  # the clip half of a Live Photo is not a tile of its own
 NOT_HIDDEN = LIVE_CLIP + " AND path NOT IN (SELECT path FROM hidden)"  # what the upload album itself shows
 # PH62: the upload album's photos show only inside that album (after the PIN), never in the timeline, search, people or places.
-NOT_LIVE_VIDEO = NOT_HIDDEN + " AND NOT in_upload(path)"  # what the timeline, albums, people and places show
+NOT_LIVE_VIDEO = NOT_HIDDEN + " AND NOT (path >= upl_lo() AND path < upl_hi())"  # what the timeline, albums, people and places show
 ONLY_HIDDEN = LIVE_CLIP + " AND path IN (SELECT path FROM hidden)"  # the Hidden album
 
 
@@ -1461,7 +1591,10 @@ def inside_root(p: Path) -> bool:
 @app.post("/ui/folders")
 def add_folder():
     """Pick a folder: it becomes an album. Own endpoint (the Immich app has no folder picker)."""
-    path = Path((request.get_json(silent=True) or {}).get("path", "")).resolve()
+    raw = (request.get_json(silent=True) or {}).get("path", "")
+    if not isinstance(raw, str) or not raw or "\0" in raw:  # PH109: a number or null was a 500; PH110: so was a NUL
+        return err("Not a folder inside the library root", 400, "Bad Request")
+    path = Path(raw).resolve()
     if not path.is_dir() or not inside_root(path):
         return err("Not a folder inside the library root", 400, "Bad Request")
     with _albums_lock:
@@ -1720,20 +1853,42 @@ def _sha1_b64(path, chunk=8 << 20, pause=0.02):
     return base64.b64encode(h.digest()).decode()
 
 
+_sha_absent: dict = {}  # PH99: asset id -> when its file was missing (not retried for 10 minutes)
+
+
 def checksum_pass(limit=20):
     """SHA-1 of files not hashed yet (a changed file is re-indexed, which clears its hash). Read with no transaction
-    open; the row is written only if the file did not change meanwhile."""
+    open; the row is written only if the file did not change meanwhile. Returns how many files were read.
+    PH99: a file that is not there right now (disk unplugged, Syncthing mid-sync) is skipped, not marked: an empty
+    checksum would stay until the file changes, and the phone could never match it to its own copy."""
     c = connect()
     try:
-        todo = c.execute("SELECT id, path, mtime FROM assets WHERE sha1 IS NULL LIMIT ?", (limit,)).fetchall()
-        for a in todo:
-            try:
-                h = _sha1_b64(a["path"])
-            except OSError:
-                h = ""  # unreadable: marked, so it is not retried every pass (cleared when the file changes)
-            c.execute("UPDATE assets SET sha1=? WHERE id=? AND mtime=?", (h, a["id"], a["mtime"]))
-            c.commit()
-        return len(todo)
+        now, done, last = time.time(), 0, ""
+        for k, t in list(_sha_absent.items()):
+            if now - t > 600:
+                _sha_absent.pop(k, None)
+        while done < limit:
+            todo = c.execute("SELECT id, path, mtime FROM assets WHERE sha1 IS NULL AND id > ? ORDER BY id LIMIT 200",
+                             (last,)).fetchall()
+            if not todo:
+                break
+            for a in todo:
+                last = a["id"]
+                if a["id"] in _sha_absent:
+                    continue
+                if not os.path.isfile(a["path"]):
+                    _sha_absent[a["id"]] = now
+                    continue
+                try:
+                    h = _sha1_b64(a["path"])
+                except OSError:
+                    h = ""  # there but unreadable: marked, so it is not retried every pass (cleared when the file changes)
+                c.execute("UPDATE assets SET sha1=? WHERE id=? AND mtime=?", (h, a["id"], a["mtime"]))
+                c.commit()
+                done += 1
+                if done >= limit:
+                    break
+        return done
     finally:
         c.close()
 
@@ -1750,7 +1905,22 @@ def dto_ctx():
     d = db()
     return dict(favs=fav_paths(), rots={r[0]: r[1] for r in d.execute("SELECT id, deg FROM rotations")},
                 lives={r[0]: r[1] for r in d.execute("SELECT still_id, video_id FROM live")},
-                hidden={r[0] for r in d.execute("SELECT path FROM hidden")})
+                hidden={r[0] for r in d.execute("SELECT path FROM hidden")}, th=_thumbhashes(d))
+
+
+def _thumbhashes(c, keys=None):
+    """PH124: tile key -> ThumbHash, for every tile (keys=None) or the given keys."""
+    if keys is None:
+        return {r[0]: r[1] for r in c.execute("SELECT key, h FROM thumbhash")}
+    out = {}
+    for k in range(0, len(keys), 500):
+        part = keys[k:k + 500]
+        out.update({r[0]: r[1] for r in c.execute(f"SELECT key, h FROM thumbhash WHERE key IN ({','.join('?' * len(part))})", part)})
+    return out
+
+
+def _th_key(a, deg):
+    return f"{cache_key(a)}-{deg}"
 
 
 def _duration_ms(a):
@@ -1765,12 +1935,14 @@ def asset_dto(a, favs=None, ctx=None):
     if ctx is None:
         ctx = dict(favs=fav_paths() if favs is None else favs, rots={a["id"]: rot_of(a["id"])},
                    lives={a["id"]: live_video_of(a["id"])}, hidden={a["path"]} if is_hidden(a["path"]) else set())
+    if "th" not in ctx:
+        ctx["th"] = _thumbhashes(db(), [_th_key(a, ctx["rots"].get(a["id"], 0))])
     w, h = (a["h"], a["w"]) if ctx["rots"].get(a["id"], 0) % 180 else (a["w"], a["h"])
     return dict(id=a["id"], type=a["kind"], originalFileName=a["name"], originalPath=a["path"], ownerId=_uid(),
                 fileCreatedAt=a["taken"], fileModifiedAt=iso(a["mtime"]), createdAt=a["taken"], updatedAt=iso(a["mtime"]),
                 localDateTime=a["taken"], width=w, height=h, duration=_duration_ms(a), isFavorite=a["path"] in ctx["favs"],
                 isArchived=False, isTrashed=False, isOffline=False, isEdited=False, hasMetadata=True,
-                visibility="locked" if a["path"] in ctx["hidden"] else "timeline", thumbhash=None, checksum=_checksum(a),
+                visibility="locked" if a["path"] in ctx["hidden"] else "timeline", thumbhash=ctx["th"].get(_th_key(a, ctx["rots"].get(a["id"], 0))), checksum=_checksum(a),
                 livePhotoVideoId=ctx["lives"].get(a["id"]), people=[], tags=[],
                 originalMimeType=mimetypes.guess_type(a["name"])[0], libraryId=None)
 
@@ -1819,13 +1991,16 @@ def _bucket_rows(args):
         sql += " AND id IN (SELECT asset_id FROM geo WHERE city=? AND cc=?)"
         par += [city, cc]
     if args.get("onThisDay", "").isdigit():
-        _, days = _this_day(int(args["onThisDay"]), window=_window(args))
-        sql += " AND " + _day_sql(days)
-        par += days
+        try:
+            _, days = _this_day(int(args["onThisDay"]), window=_window(args))
+            sql += " AND " + _day_sql(days)
+            par += _day_par(days)
+        except (ValueError, OverflowError):  # PH110: before the year 1 (?onThisDay=2026): no photos, not a 500
+            sql += " AND 0"
     if args.get("thisMonth", "").isdigit():  # PH85: this month in an earlier year
         y, mth = _this_month(int(args["thisMonth"]))
-        sql += " AND substr(taken,1,7)=?"
-        par.append(f"{y}-{mth}")
+        sql += " AND (taken >= ? AND taken < ?)"
+        par += _month_par(f"{y}-{mth}")
     if args.get("bbox"):  # PH77: the photos of one spot on the map (south, west, north, east)
         try:
             so, we, no, ea = (float(v) for v in args["bbox"].split(","))
@@ -1833,6 +2008,13 @@ def _bucket_rows(args):
             abort(400)
         sql += " AND id IN (SELECT asset_id FROM geo WHERE lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?)"
         par += [so, no, we, ea]
+    for k, op in (("from", ">="), ("to", "<=")):  # PH125: the map's date range, kept when a spot is opened
+        v = args.get(k, "")
+        if v:
+            if not re.fullmatch(r"\d{4}-\d\d-\d\d", v):
+                abort(400)
+            sql += f" AND substr(taken, 1, 10) {op} ?"
+            par.append(v)
     if args.get("personId"):
         sql += " AND id IN (SELECT asset_id FROM faces WHERE person_id=?)"
         par.append(args["personId"])
@@ -1898,8 +2080,11 @@ def buckets():
                 out.append(dict(timeBucket=f"grp:{r['gk']}:{i}", count=min(PAGE, r["n"] - i * PAGE), label=group_label(sort, r["gk"])))
         return jsonify(out)
     m = MONTH_EXPR.get(sort, MONTH_EXPR["capture"])
-    rows = db().execute(sql.replace("SELECT *", f"SELECT {m} m, COUNT(*) n", 1) + f" GROUP BY m ORDER BY m {d}", par).fetchall()
-    return jsonify([dict(timeBucket=(r["m"] or "1970-01") + "-01T00:00:00.000Z", count=r["n"]) for r in rows])
+    # PH118: "ratio" (an extra field; Immich clients ignore it) is the sum of the month's width/height, so the web app
+    # can reserve a not-yet-loaded month's justified height
+    rows = db().execute(sql.replace("SELECT *", f"SELECT {m} m, COUNT(*) n, SUM(CASE WHEN w > 0 AND h > 0 THEN MIN(3.0, MAX(0.4, CASE WHEN id IN (SELECT id FROM rotations WHERE deg IN (90, 270)) THEN h * 1.0 / w ELSE w * 1.0 / h END)) ELSE 1 END) rs", 1)
+                        + f" GROUP BY m ORDER BY m {d}", par).fetchall()
+    return jsonify([dict(timeBucket=(r["m"] or "1970-01") + "-01T00:00:00.000Z", count=r["n"], ratio=round(r["rs"] or 0, 2)) for r in rows])
 
 
 def _group_order(sort, d):
@@ -1945,6 +2130,7 @@ def bucket():
         part, q = ids[k:k + 500], ",".join("?" * len(ids[k:k + 500]))
         rots.update({r["id"]: r["deg"] for r in db().execute(f"SELECT id, deg FROM rotations WHERE id IN ({q})", part)})
         lives.update({r["still_id"]: r["video_id"] for r in db().execute(f"SELECT still_id, video_id FROM live WHERE still_id IN ({q})", part)})
+    hashes = _thumbhashes(db(), [_th_key(a, rots.get(a["id"], 0)) for a in rows])
     turned = {i for i, d in rots.items() if d in (90, 270)}
     ratio = lambda a: (a["h"] / a["w"] if a["id"] in turned else a["w"] / a["h"]) if a["h"] and a["w"] else 1
     return jsonify(
@@ -1953,7 +2139,8 @@ def bucket():
         isFavorite=col(lambda a: a["path"] in favs), isTrashed=col(lambda a: False), fileCreatedAt=col(lambda a: a["taken"]),
         createdAt=col(lambda a: a["taken"]), localOffsetHours=col(lambda a: 0),
         duration=col(_duration_ms),
-        ratio=col(lambda a: round(ratio(a), 4)), rotation=col(lambda a: rots.get(a["id"], 0)), thumbhash=col(lambda a: None),
+        ratio=col(lambda a: round(ratio(a), 4)), rotation=col(lambda a: rots.get(a["id"], 0)), thumbhash=col(lambda a: hashes.get(f"{cache_key(a)}-{rots.get(a['id'], 0)}")),
+        ver=col(thumb_ver),  # PH108: the web app puts it in thumbnail URLs, so an edited file gets a new tile at once
         livePhotoVideoId=col(lambda a: lives.get(a["id"])), projectionType=col(lambda a: None),
         visibility=col(lambda a: "locked" if request.args.get("hidden") == "true" or request.args.get("visibility") == "locked" else "timeline"), stack=col(lambda a: None), city=col(lambda a: None),
         country=col(lambda a: None), latitude=col(lambda a: None), longitude=col(lambda a: None))
@@ -1970,10 +2157,30 @@ def _asset(asset_id):
 
 
 @app.after_request
+def _etag(resp):
+    """PH119: JSON a client asks for again (timeline, buckets, albums, people...) answers 304 Not Modified when it is
+    unchanged, so a refresh or a poll of an unchanged library costs headers, not the whole list. The tag is the
+    body's hash, so it can never claim "unchanged" for data that changed (favorites, hides and rotations included)."""
+    if (request.method == "GET" and resp.status_code == 200 and resp.mimetype == "application/json"
+            and not resp.is_streamed and not resp.direct_passthrough and request.path.startswith(("/api/", "/ui/"))):
+        resp.add_etag()
+        if "Cache-Control" not in resp.headers:
+            resp.headers["Cache-Control"] = "private, no-cache"  # keep it, but ask every time (cheap with the tag)
+        resp.make_conditional(request)
+    return resp
+
+
+@app.after_request
 def _no_store(resp):
-    """A hidden photo must not stay in the browser cache after the album is locked again."""
+    """A hidden photo must not stay in the browser cache after the album is locked again.
+    PH105: everything else this app sends with a lifetime needs the login too, so it may stay in the browser's own cache
+    only: send_file(max_age=...) marks it "public", which lets a shared cache (a proxy in front of the app) keep a photo
+    and hand it to someone with no session."""
     if g.get("private"):
         resp.headers["Cache-Control"] = "no-store"
+    elif resp.cache_control.public:
+        resp.cache_control.public = False
+        resp.cache_control.private = True
     return resp
 
 
@@ -2074,17 +2281,42 @@ def playback_copy(a, wait=True):
     return None
 
 
+PLAYBACK_WAIT = 20.0  # PH98: seconds a phone request may wait for its MP4 copy (a short clip is ready by then)
+_pb_waiters = threading.BoundedSemaphore(2)  # at most 2 of the 8 threads ever wait for an encode
+
+
+def _copy_within(a, secs):
+    """The MP4 copy if it is (or becomes) ready within secs; the encode itself always runs in the background."""
+    end, out = time.time() + secs, playback_copy(a, wait=False)
+    while out is None and time.time() < end and _tjobs.get(a["id"], {}).get("state") != "error":
+        time.sleep(0.25)
+        out = playback_path(a) if playback_path(a).exists() else None
+    return out
+
+
 @app.get("/api/assets/<asset_id>/video/playback")
 def video_playback(asset_id):
-    """The phone app: HEVC and other natively playable videos as-is; others from the cached MP4 (made on first call)."""
+    """The phone app: HEVC and other natively playable videos as-is; others from the cached MP4. PH98: no request runs
+    the encode (up to 15 min, and the player sends several range requests): a copy not ready after PLAYBACK_WAIT
+    answers 503 + Retry-After while it is made; if ffmpeg fails, the original is sent as before."""
     a = _asset(asset_id)
     if a["kind"] == "VIDEO" and not web_playable(Path(_file(a)), a, NATIVE_VCODECS):
         try:
-            copy = playback_copy(a)
+            if _pb_waiters.acquire(blocking=False):
+                try:
+                    copy = _copy_within(a, PLAYBACK_WAIT)
+                finally:
+                    _pb_waiters.release()
+            else:
+                copy = playback_copy(a, wait=False)
         except (OSError, subprocess.SubprocessError):
-            copy = None
+            return original(asset_id)
         if copy:
             return send_file(copy, mimetype="video/mp4", conditional=True)
+        if _tjobs.get(a["id"], {}).get("state") != "error":
+            body, code = err("This video is being converted for playback; try again in a minute", 503, "Service Unavailable")
+            body.headers["Retry-After"] = "15"
+            return body, code
     return original(asset_id)
 
 
@@ -2182,7 +2414,16 @@ def thumbnail(asset_id):
             out = make_thumb(a, size, deg, _file(a))
         except BAD_IMAGE + (subprocess.SubprocessError,):
             abort(404)  # unreadable or undecodable: the tile shows its placeholder
-    return send_file(out, mimetype="image/webp", max_age=86400)
+    # PH108: a day in the browser only for a URL naming this version of the file (?v=<rotation>.<ver>, the timeline's);
+    # any other URL (album covers, explore cards, map) is checked again after 5 minutes (a 304 when unchanged), so a
+    # file edited in place no longer shows its old picture for a day
+    fresh = request.args.get("v", "").endswith("." + thumb_ver(a))
+    return send_file(out, mimetype="image/webp", max_age=86400 if fresh else 300)
+
+
+def thumb_ver(a):
+    """The file's version for thumbnail URLs: its mtime, as in cache_key (the cache's own names)."""
+    return format(int((a["mtime"] or 0) * 1000), "x")
 
 
 def cached_thumb(a, size):
@@ -2219,9 +2460,67 @@ def make_thumb(a, size, deg, path):
                 im = im.rotate(-deg, expand=True)
             im.thumbnail((size, size))
             tmp = out.with_name(f"{out.name}.{secrets.token_hex(4)}.tmp")
-            im.convert("RGB").save(tmp, "WEBP", quality=80)
+            im = im.convert("RGB")
+            im.save(tmp, "WEBP", quality=80)
             tmp.replace(out)
+    if size == 250:  # PH124: outside the render slot: a busy database never holds up the next render
+        _store_thumbhash(a, deg, im)
     return out
+
+
+def _store_thumbhash(a, deg, im, c=None):
+    """PH117: the tile's ThumbHash, keyed like the tile (asset, mtime, rotation), so the timeline can paint a blurred
+    preview before any thumbnail loads. Never fails the render it rides on. With c, the caller's connection and commit."""
+    try:
+        h = thumbhash.encode_b64(im)
+        own = c is None
+        c = c or connect()
+        try:
+            c.execute("INSERT OR REPLACE INTO thumbhash(key, h) VALUES(?, ?)", (_th_key(a, deg), h))
+            if own:
+                c.commit()
+        finally:
+            if own:
+                c.close()
+    except Exception:
+        app.logger.exception("thumbhash failed for %s", a["id"])
+
+
+_th_idle = [None]  # PH124: the library's state when the last backfill found nothing to do
+
+
+def thumbhash_pass(limit=300):
+    """PH117: hashes for tiles made before ThumbHash existed, read from the cached 250 px tile (never the original)."""
+    c = connect()
+    try:
+        key = tuple(c.execute("SELECT COUNT(*), MAX(mtime), (SELECT COUNT(*) FROM rotations), (SELECT COUNT(*) FROM thumbhash) FROM assets").fetchone())
+        if _th_idle[0] == key:
+            return 0  # PH124: nothing new since the last walk: no stat() of every tile every 5 minutes
+        have = {r[0] for r in c.execute("SELECT key FROM thumbhash")}
+        rots = {r[0]: r[1] for r in c.execute("SELECT id, deg FROM rotations")}
+        n, missing = 0, 0
+        for a in c.execute(f"SELECT id, mtime FROM assets WHERE {LIVE_CLIP} ORDER BY taken DESC").fetchall():  # PH126: two columns, not every row whole
+            deg = rots.get(a["id"], 0)
+            if _th_key(a, deg) in have:
+                continue
+            t = thumb_path(a, 250)
+            if not t.exists():
+                missing += 1  # its tile is still to be made (thumbs_pass), and gets its hash then
+                continue
+            try:
+                with Image.open(t) as im:
+                    _store_thumbhash(a, deg, im, c)
+            except BAD_IMAGE:
+                continue
+            n += 1
+            if n >= limit:
+                break
+        c.commit()
+        if n == 0:
+            _th_idle[0] = key
+        return n
+    finally:
+        c.close()
 
 
 _thumb_failed: set = set()  # (cache key, size) that could not be rendered: not retried until the file changes
@@ -2272,11 +2571,10 @@ def update_assets():
     if not isinstance(b["ids"], list) or len(b["ids"]) > 1000:
         return err("ids must be a list of up to 1000 asset ids", 400, "Bad Request")
     targets = [_asset(i) for i in b["ids"]]  # every id is checked (404/403) before anything changes: no partial apply
-    for a in targets:  # "locked" is Immich's Locked folder = our Hidden album
-        if "isFavorite" in b:
-            set_favorite(a, bool(b["isFavorite"]))
-        if "visibility" in b:
-            set_hidden(a, b["visibility"] == "locked")
+    if "isFavorite" in b:  # PH115: one write of favorites.json / hidden.json for the whole list
+        _mark("favorites.json", targets, bool(b["isFavorite"]))
+    if "visibility" in b:  # "locked" is Immich's Locked folder = our Hidden album
+        set_hidden_many(targets, b["visibility"] == "locked")
     return "", 204
 
 
@@ -2289,6 +2587,8 @@ def refuse_write():  # PH6: no uploads, no batch deletes
 @app.post("/api/assets/bulk-upload-check")
 def bulk_check():
     items = (request.get_json(silent=True) or {}).get("assets", [])
+    if not isinstance(items, list) or not all(isinstance(i, dict) for i in items):  # PH114
+        return err("assets must be a list of objects", 400, "Bad Request")
     return jsonify(results=[dict(id=i.get("id"), action="reject", reason="duplicate") for i in items])
 
 
@@ -2302,6 +2602,8 @@ def asset_stats():
 @app.post("/ui/favorite")
 def ui_favorite():
     b = request.get_json(silent=True) or {}
+    if not isinstance(b.get("favorite", False), bool):  # PH126: "false" as text made it a favorite
+        return err("favorite must be true or false", 400, "Bad Request")
     set_favorite(_asset(b.get("id", "")), bool(b.get("favorite")))
     return jsonify(ok=True)
 
@@ -2309,7 +2611,10 @@ def ui_favorite():
 @app.get("/ui/tree")
 def ui_tree():
     """Sub-folders of a folder inside the library root, for the folder picker."""
-    p = Path(request.args.get("path") or browse_root()).resolve()
+    raw = request.args.get("path") or str(browse_root())
+    if "\0" in raw:  # PH110: a NUL byte made resolve() raise: a 500
+        return err("Not a folder inside the library root", 400, "Bad Request")
+    p = Path(raw).resolve()
     if not p.is_dir() or not inside_root(p):
         return err("Not a folder inside the library root", 400, "Bad Request")
     picked = {r["path"] for r in db().execute("SELECT path FROM folders")}
@@ -2367,11 +2672,23 @@ def ui_new_album():
     p = (browse_root() / name).resolve()
     if p.parent != browse_root().resolve():
         return err("Give a plain folder name", 400, "Bad Request")
-    if p.exists():
+    try:
+        p.mkdir()  # fails if the name is taken, also by a folder made since any check we could do first
+    except FileExistsError:
         return err("A folder with that name already exists: use Add folder to pick it", 409, "Conflict")
-    p.mkdir()
-    bad = _albums_edit(lambda up, ents: (up, ents + [(_rel(p), None)]))
-    return bad or (jsonify(id=aid(str(p)), path=str(p)), 201)
+    # PH107: if albums.yml cannot be read or written the album is not made, so its folder goes too: otherwise it stays
+    # behind unlisted, and trying the same name again after fixing albums.yml says it "already exists"
+    try:
+        bad = _albums_edit(lambda up, ents: (up, ents + [(_rel(p), None)]))
+    except OSError as e:
+        bad = err(f"albums.yml cannot be written: {e}", 500, "Internal Server Error")
+    if bad:
+        try:
+            p.rmdir()  # only ever the empty folder made just above (rmdir refuses one with anything in it)
+        except OSError:
+            pass
+        return bad
+    return jsonify(id=aid(str(p)), path=str(p)), 201
 
 
 @app.put("/ui/folders/<folder_id>")
@@ -2485,8 +2802,14 @@ def _trash_asset(a, extra=None, hidden=None):
         return False
     hidden = is_hidden(a["path"]) if hidden is None else hidden
     fav = a["path"] in fav_paths()
+    # PH96: the id comes from the path, so a later file at the same path has the same id: it gets its own folder
     dest = trash_dir() / a["id"]
-    dest.mkdir(exist_ok=True)
+    while True:
+        try:
+            dest.mkdir()
+            break
+        except FileExistsError:
+            dest = trash_dir() / f"{a['id']}~{secrets.token_hex(4)}"
     (dest / "meta.json").write_text(json.dumps(dict(
         id=a["id"], name=a["name"], path=a["path"], folder_id=a["folder_id"], kind=a["kind"], taken=a["taken"],
         size=a["size"], w=a["w"], h=a["h"], deleted=time.time(), hidden=hidden, favorite=fav,
@@ -2504,7 +2827,7 @@ def _trash_asset(a, extra=None, hidden=None):
     if hidden:
         db().execute("DELETE FROM hidden WHERE path=?", (a["path"],))
     _orphans.set()
-    return True
+    return dest.name  # the trash id (the asset id, unless that one is already in the trash)
 
 
 def _delete_asset(asset_id):
@@ -2514,9 +2837,8 @@ def _delete_asset(asset_id):
         return False
     vid = live_video_of(asset_id)
     v = db().execute("SELECT * FROM assets WHERE id=?", (vid,)).fetchone() if vid else None
-    partner, hid = None, is_hidden(a["path"])
-    if v is not None and _trash_asset(v, dict(liveOf=asset_id), hidden=hid):  # a Live Photo goes as one: its clip leaves with it
-        partner = vid
+    hid = is_hidden(a["path"])
+    partner = _trash_asset(v, dict(liveOf=asset_id), hidden=hid) if v is not None else None  # a Live Photo goes as one
     _trash_asset(a, dict(livePartner=partner) if partner else None, hidden=hid)
     db().execute("DELETE FROM live WHERE still_id=? OR video_id=?", (asset_id, asset_id))
     db().commit()
@@ -2598,9 +2920,9 @@ def _trash_items(open_):
 @app.get("/ui/trash")
 def ui_trash():
     """A read never deletes: expired items are purged by the background worker once a day (PH73)."""
-    out = [dict(id=m["id"], name=m["name"], path=m["path"], deleted=iso(m["deleted"]), kind=m.get("kind"),
-                daysLeft=max(0, int(TRASH_DAYS - (time.time() - m["deleted"]) / 86400)))
-           for m, _ in _trash_items(unlocked())]
+    out = [dict(id=d.name, name=m["name"], path=m["path"], deleted=iso(m["deleted"]), kind=m.get("kind"),
+                daysLeft=max(0, math.ceil(TRASH_DAYS - (time.time() - m["deleted"]) / 86400)))  # PH126: rounded up: 0 only when due
+           for m, d in _trash_items(unlocked())]
     return jsonify(sorted(out, key=lambda x: x["deleted"], reverse=True))
 
 
@@ -2621,7 +2943,13 @@ def trash_count():
 def ui_counts():
     """PH63: the sidebar numbers: All photos counted like the timeline (nested albums once, no upload album, no hidden)."""
     n = db().execute(f"SELECT COUNT(*) FROM assets WHERE {NOT_LIVE_VIDEO}").fetchone()[0]
-    fav = len([p for p in fav_paths()])
+    # PH104: favorites counted like the Favorites view: a hidden, upload-album or no-longer-there favorite is not shown
+    # there, so it is not in the number either (it also said a hidden favorite existed without the PIN)
+    favs, fav = sorted(fav_paths()), 0
+    for k in range(0, len(favs), 500):
+        part = favs[k:k + 500]
+        fav += db().execute(f"SELECT COUNT(*) FROM assets WHERE path IN ({','.join('?' * len(part))}) AND {NOT_LIVE_VIDEO}",
+                            part).fetchone()[0]
     return jsonify(all=n, trash=trash_count(), favorites=fav)
 
 
@@ -2687,7 +3015,7 @@ def _restore_one(d, dst=None):
 def _restore_item(d, m, rename=False):
     """Restore one item (and its Live Photo clip, both or neither). rename=True puts it back under a free name, the
     clip under the same new stem, when the old name is taken (PH74)."""
-    pd = trash_dir() / m["livePartner"] if m.get("livePartner") else None
+    pd = trash_dir() / Path(m["livePartner"]).name if m.get("livePartner") else None
     if pd is not None and not (pd / "meta.json").exists():
         pd = None
     dst = Path(m["path"])
@@ -2854,14 +3182,19 @@ _vid_slot = _tslot  # video conversions share the transcode slot: one ffmpeg enc
 _img_slot = threading.Semaphore(1)  # one image conversion at a time: a big resize needs hundreds of MB
 
 
-def _index_new(folder_id, out: Path, hidden=False):
-    """Index a converted file; the copy of a hidden photo is hidden too (else it would show on the timeline)."""
+def _index_new(folder_id, out: Path, hidden=False, src=None):
+    """Index a converted file; the copy of a hidden photo is hidden too (else it would show on the timeline).
+    PH111: whether the source is hidden is asked again now (a video converts for minutes: it may have been hidden
+    meanwhile), and the copy's row and its hidden mark are committed together, so no sync or timeline sees it shown."""
     with app.app_context():
+        hidden = hidden or (src is not None and is_hidden(str(src)))
         index_file(db(), folder_id, out)
+        if hidden:
+            db().execute("INSERT OR IGNORE INTO hidden VALUES(?)", (str(out),))
         db().commit()
         new = db().execute("SELECT * FROM assets WHERE path=?", (str(out),)).fetchone()
         if hidden and new is not None:
-            set_hidden(new, True)
+            set_hidden(new, True)  # hidden.json too, so a rescan keeps it hidden
     return str(uuid.uuid5(NS, "file:" + str(out)))
 
 
@@ -2886,7 +3219,7 @@ def ui_convert():
             return err(str(e), 400, "Bad Request")
         except BAD_IMAGE as e:
             return err("Could not convert: %s" % e, 422, "Unprocessable Entity")
-        return jsonify(assetId=_index_new(fid, out, hid), name=out.name), 201
+        return jsonify(assetId=_index_new(fid, out, hid, src), name=out.name), 201
     jid = secrets.token_hex(6)
     job = _cjobs[jid] = {"state": "queued", "progress": 0, "name": src.name}
     for k in [k for k, v in _cjobs.items() if v["state"] in ("done", "error")][:-20]:
@@ -2897,7 +3230,7 @@ def ui_convert():
             job["state"] = "running"
             try:
                 out = convert.convert_video(src, op, p, work, lambda n: job.update(progress=n))
-                job.update(state="done", progress=100, assetId=_index_new(fid, out, hid), name=out.name)
+                job.update(state="done", progress=100, assetId=_index_new(fid, out, hid, src), name=out.name)
             except Exception as e:
                 app.logger.exception("video conversion failed")
                 job.update(state="error", error=str(e))
@@ -3004,7 +3337,7 @@ def image_metadata(p: Path):
 
 
 def video_metadata(p: Path):
-    out = subprocess.run(["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(p)],
+    out = subprocess.run(["ffprobe", *FF_SAFE, "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(p)],
                          capture_output=True, timeout=20, check=True).stdout
     j = json.loads(out)
     f = j.get("format", {})
@@ -3056,9 +3389,11 @@ def ui_metadata(asset_id):
 def ui_map():
     """Every photo with GPS as compact columns (id, lat, lon), the same set the timeline shows (never hidden or upload
     album photos). The page clusters them; nothing leaves the tailnet (no tile server: a bundled world outline)."""
-    rows = db().execute(f"SELECT g.asset_id id, g.lat, g.lon FROM geo g WHERE g.lat IS NOT NULL "
-                        f"AND g.asset_id IN (SELECT id FROM assets WHERE {NOT_LIVE_VIDEO})").fetchall()
-    return jsonify(id=[r["id"] for r in rows], lat=[round(r["lat"], 5) for r in rows], lon=[round(r["lon"], 5) for r in rows])
+    rows = db().execute(f"SELECT g.asset_id id, g.lat, g.lon, substr(a.taken, 1, 10) day FROM geo g JOIN assets a ON a.id = g.asset_id "
+                        f"WHERE g.lat IS NOT NULL AND {NOT_LIVE_VIDEO}").fetchall()  # PH125: one scan, not a join plus an IN
+    # PH120: each pin's day, so the page can show only a date range
+    return jsonify(id=[r["id"] for r in rows], lat=[round(r["lat"], 5) for r in rows], lon=[round(r["lon"], 5) for r in rows],
+                   day=[r["day"] or "" for r in rows])
 
 
 @app.get("/ui/stats")
@@ -3111,8 +3446,9 @@ _faces_started = False
 
 
 def _person_dto(r, count=None):
-    return dict(id=r["id"], name=r["name"], birthDate=None, thumbnailPath=f"/api/people/{r['id']}/thumbnail",
-                isHidden=bool(r["hidden"]), isFavorite=False, updatedAt=iso(time.time()),
+    k = r.keys()
+    return dict(id=r["id"], name=r["name"], birthDate=r["birth"] if "birth" in k else None, thumbnailPath=f"/api/people/{r['id']}/thumbnail",
+                isHidden=bool(r["hidden"]), isFavorite=bool(r["fav"]) if "fav" in k else False, updatedAt=iso(time.time()),
                 otherPeople=[], sharedBy=[], sharedWith=[])
 
 
@@ -3360,7 +3696,7 @@ def _bg_worker():
                 if time.time() - last_daily > 86400:
                     last_daily = time.time()
                     daily_sweep()
-                busy = (thumbs_pass() or thumbs_pass(size=1440)) + checksum_pass()  # PH93: previews once the grid is done
+                busy = (thumbs_pass() or thumbs_pass(size=1440)) + checksum_pass() + thumbhash_pass()  # PH93: previews once the grid is done
                 time.sleep(2 if busy else 300)
             except Exception:
                 app.logger.exception("background pass failed")
@@ -3375,24 +3711,40 @@ def daily_sweep():
     try:
         c.execute("DELETE FROM tokens WHERE created < ?", (time.time() - TOKEN_DAYS * 86400,))
         c.execute("DELETE FROM sessions WHERE hash NOT IN (SELECT hash FROM tokens)")
+        prune_thumbhashes(c)
         c.commit()
     finally:
         c.close()
     trash_purge()
 
 
+def prune_thumbhashes(c):
+    """PH124: hashes of files that changed, were rotated again or are gone: every edit left one row behind for good."""
+    rots = {r[0]: r[1] for r in c.execute("SELECT id, deg FROM rotations")}
+    live = {_th_key(a, rots.get(a["id"], 0)) for a in c.execute("SELECT id, mtime FROM assets")}
+    stale = [(k,) for (k,) in c.execute("SELECT key FROM thumbhash") if k not in live]
+    c.executemany("DELETE FROM thumbhash WHERE key=?", stale)
+    return len(stale)
+
+
 def people_rows(hidden=False, everyone=False):
     """People worth listing: named, or seen in at least MIN_SHOW photos. Most photos first."""
     having = "" if everyone else f"HAVING p.name != '' OR cnt >= {faces.MIN_SHOW}"
     return db().execute(
-        f"SELECT p.id, p.name, p.hidden, COUNT(DISTINCT f.asset_id) cnt FROM persons p "
-        f"JOIN faces f ON f.person_id=p.id JOIN assets a ON a.id=f.asset_id WHERE p.hidden=? AND a.path NOT IN (SELECT path FROM hidden) AND NOT in_upload(a.path) GROUP BY p.id {having} "
+        f"SELECT p.id, p.name, p.hidden, p.birth, p.fav, COUNT(DISTINCT f.asset_id) cnt FROM persons p "
+        f"JOIN faces f ON f.person_id=p.id JOIN assets a ON a.id=f.asset_id WHERE p.hidden=? AND a.path NOT IN (SELECT path FROM hidden UNION SELECT v.path FROM live l JOIN assets v ON v.id=l.video_id JOIN assets s ON s.id=l.still_id JOIN hidden h ON h.path=s.path) AND NOT (a.path >= upl_lo() AND a.path < upl_hi()) GROUP BY p.id {having} "
         f"ORDER BY (p.name = ''), cnt DESC, p.name", (1 if hidden else 0,)).fetchall()
 
 
 @app.get("/ui/people")
 def ui_people():
-    return jsonify([dict(id=r["id"], name=r["name"], count=r["cnt"]) for r in people_rows(request.args.get("hidden") == "1")])
+    rows = people_rows(request.args.get("hidden") == "1")
+    if request.args.get("fav") == "1":  # PH121: the Favorites filter
+        rows = [r for r in rows if r["fav"]]
+    lim = request.args.get("limit", "")
+    if lim.isdigit():  # PH126: Explore shows 14, it does not need all 1,400
+        rows = rows[:int(lim)]
+    return jsonify([dict(id=r["id"], name=r["name"], count=r["cnt"], birth=r["birth"], fav=bool(r["fav"])) for r in rows])
 
 
 @app.get("/ui/faces/status")
@@ -3414,10 +3766,30 @@ def ui_person_update(pid):
     p = _person(pid)
     b = request.get_json(silent=True) or {}
     name = str(b["name"]).strip()[:100] if "name" in b else p["name"]
+    for k in ("isHidden", "hidden", "isFavorite"):  # PH125: "false" (a string) is not true
+        if k in b and not isinstance(b[k], (bool, int)):
+            return err(f"{k} must be true or false", 400, "Bad Request")
     hidden = int(bool(b["isHidden"] if "isHidden" in b else b.get("hidden", p["hidden"])))
-    db().execute("UPDATE persons SET name=?, hidden=? WHERE id=?", (name, hidden, pid))
+    fav = int(bool(b["isFavorite"])) if "isFavorite" in b else (p["fav"] or 0)
+    birth = p["birth"]
+    if "birthDate" in b:  # PH121: "YYYY-MM-DD", or null / "" to clear; never in the future
+        v = b["birthDate"]
+        if v in (None, ""):
+            birth = None
+        else:
+            try:
+                sv = str(v)
+                if len(sv) > 10 and not re.fullmatch(r"T00:00:00(\.0+)?Z?", sv[10:]):  # a date, or Immich's date at midnight
+                    raise ValueError
+                d = datetime.strptime(sv[:10], "%Y-%m-%d").date()
+            except ValueError:
+                return err("birthDate must be YYYY-MM-DD", 400, "Bad Request")
+            if d > datetime.now().date() or d.year < 1800:
+                return err("birthDate is out of range", 400, "Bad Request")
+            birth = d.isoformat()
+    db().execute("UPDATE persons SET name=?, hidden=?, fav=?, birth=? WHERE id=?", (name, hidden, fav, birth, pid))
     db().commit()
-    return jsonify(id=pid, name=name, hidden=bool(hidden))
+    return jsonify(id=pid, name=name, hidden=bool(hidden), isFavorite=bool(fav), birthDate=birth)
 
 
 @app.post("/ui/people/hide-unnamed")
@@ -3426,7 +3798,7 @@ def ui_people_hide_unnamed():
     b = request.get_json(silent=True) or {}
     try:
         below = min(50, max(2, int(b.get("below", 5))))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # PH114: JSON 1e999 is inf
         return err("below must be a number", 400, "Bad Request")
     if b.get("confirm") is not True:
         return err("Needs confirm: true", 400, "Bad Request")
@@ -3457,8 +3829,9 @@ def ui_person_merge(pid):
     cen = faces.merge_centroid(np.frombuffer(dst["centroid"], np.float32), dst["n"], np.frombuffer(src["centroid"], np.float32), src["n"])
     c.execute("UPDATE faces SET person_id=? WHERE person_id=?", (dst["id"], src["id"]))
     best = src if (src["cover_q"] or 0) > (dst["cover_q"] or 0) else dst
-    c.execute("UPDATE persons SET centroid=?, n=?, name=?, cover=?, cover_q=? WHERE id=?",
-              (cen.tobytes(), dst["n"] + src["n"], dst["name"] or src["name"], best["cover"], best["cover_q"], dst["id"]))
+    c.execute("UPDATE persons SET centroid=?, n=?, name=?, cover=?, cover_q=?, birth=?, fav=? WHERE id=?",
+              (cen.tobytes(), dst["n"] + src["n"], dst["name"] or src["name"], best["cover"], best["cover_q"],
+               dst["birth"] or src["birth"], int(bool(dst["fav"] or src["fav"])), dst["id"]))  # PH124: neither is lost
     c.execute("DELETE FROM persons WHERE id=?", (src["id"],))
     c.commit()
     return jsonify(id=dst["id"])
@@ -3471,17 +3844,30 @@ SUGGEST_MIN = 0.30  # centroid similarity below SAME_PERSON (0.40, which would a
 def ui_people_suggestions():
     """PH55: unnamed groups that look like a named person: one question each, best match first."""
     c = db()
-    named = [r for r in people_rows(everyone=True) if r["name"]]
-    cen = {r["id"]: np.frombuffer(c.execute("SELECT centroid FROM persons WHERE id=?", (r["id"],)).fetchone()[0], np.float32) for r in named}
-    no = {(r[0], r[1]) for r in c.execute("SELECT src, dst FROM merge_no")}
+    rows = people_rows(everyone=True)  # one pass: the unnamed groups people_rows() lists are those seen MIN_SHOW times
+    named = [r for r in rows if r["name"]]
+    unnamed = [r for r in rows if not r["name"] and r["cnt"] >= faces.MIN_SHOW]
+    if not named or not unnamed:
+        return jsonify([])
+    # PH106: every centroid in one read and every pair in one matrix product, not a query and a Python dot product
+    # per group (1,400 groups and 40 names: 1,400 queries and 54,000 dot products per call)
+    blob = dict(c.execute("SELECT id, centroid FROM persons WHERE centroid IS NOT NULL"))
+    named = [n for n in named if n["id"] in blob]
+    unnamed = [r for r in unnamed if r["id"] in blob]
+    if not named or not unnamed:
+        return jsonify([])
+    sims = (np.stack([np.frombuffer(blob[r["id"]], np.float32) for r in unnamed])
+            @ np.stack([np.frombuffer(blob[n["id"]], np.float32) for n in named]).T)
+    col = {n["id"]: j for j, n in enumerate(named)}
+    row = {r["id"]: i for i, r in enumerate(unnamed)}
+    for src, dst in c.execute("SELECT src, dst FROM merge_no"):
+        if src in row and dst in col:
+            sims[row[src], col[dst]] = -np.inf  # "not the same person" was answered
     out = []
-    for r in people_rows():
-        if r["name"]:
-            continue
-        v = np.frombuffer(c.execute("SELECT centroid FROM persons WHERE id=?", (r["id"],)).fetchone()[0], np.float32)
-        best = max(((float(cen[n["id"]] @ v), n) for n in named if (r["id"], n["id"]) not in no), key=lambda t: t[0], default=None)
-        if best and best[0] >= SUGGEST_MIN:
-            out.append(dict(id=r["id"], count=r["cnt"], intoId=best[1]["id"], intoName=best[1]["name"], score=round(best[0], 2)))
+    for i, r in enumerate(unnamed):
+        j = int(np.argmax(sims[i]))
+        if sims[i, j] >= SUGGEST_MIN:
+            out.append(dict(id=r["id"], count=r["cnt"], intoId=named[j]["id"], intoName=named[j]["name"], score=round(float(sims[i, j]), 2)))
     return jsonify(sorted(out, key=lambda x: -x["score"])[:12])
 
 
@@ -3501,7 +3887,7 @@ def ui_person_faces(pid):
     p = _person(pid)
     cen = np.frombuffer(p["centroid"], np.float32)
     rows = db().execute("SELECT f.id, f.asset_id, f.emb FROM faces f JOIN assets a ON a.id=f.asset_id "
-                        "WHERE f.person_id=? AND a.path NOT IN (SELECT path FROM hidden) AND NOT in_upload(a.path)", (pid,)).fetchall()
+                        "WHERE f.person_id=? AND a.path NOT IN (SELECT path FROM hidden UNION SELECT v.path FROM live l JOIN assets v ON v.id=l.video_id JOIN assets s ON s.id=l.still_id JOIN hidden h ON h.path=s.path) AND NOT (a.path >= upl_lo() AND a.path < upl_hi())", (pid,)).fetchall()
     sims = sorted(((float(np.frombuffer(r["emb"], np.float32) @ cen), r) for r in rows), key=lambda t: t[0])[:48]
     return jsonify([dict(faceId=r["id"], assetId=r["asset_id"], score=round(sc, 2)) for sc, r in sims])
 
@@ -3509,9 +3895,9 @@ def ui_person_faces(pid):
 @app.get("/ui/assets/<asset_id>/faces")
 def ui_asset_faces(asset_id):
     _asset(asset_id)
-    rows = db().execute("SELECT f.id fid, f.person_id, p.name FROM faces f LEFT JOIN persons p ON p.id=f.person_id "
+    rows = db().execute("SELECT f.id fid, f.person_id, p.name, p.birth FROM faces f LEFT JOIN persons p ON p.id=f.person_id "
                         "WHERE f.asset_id=? AND COALESCE(p.hidden, 0)=0 ORDER BY f.x", (asset_id,)).fetchall()
-    return jsonify([dict(faceId=r["fid"], personId=r["person_id"], name=r["name"] or "") for r in rows])
+    return jsonify([dict(faceId=r["fid"], personId=r["person_id"], name=r["name"] or "", birth=r["birth"]) for r in rows])
 
 
 TAG_BOX = 0.12   # side of the box (fraction of the picture) for a face the detector missed
@@ -3591,6 +3977,7 @@ def ui_face_person(fid):
 def ui_face_remove(fid):
     """The face was put with the wrong person: give it a group of its own (it can then be merged or named properly)."""
     f = db().execute("SELECT * FROM faces WHERE id=?", (fid,)).fetchone() or abort(404)
+    _asset(f["asset_id"])  # PH100: a face on a hidden or upload-album photo needs the PIN, like every other face edit
     old = f["person_id"]
     c = db()
     op = c.execute("SELECT name FROM persons WHERE id=?", (old,)).fetchone() if old else None
@@ -3645,8 +4032,8 @@ def ui_face_crop(fid):
 @app.get("/ui/people/<pid>/thumbnail")
 def person_thumbnail(pid):
     cover = _person(pid)["cover"] or abort(404)
-    if not unlocked() and db().execute("SELECT 1 FROM faces f JOIN assets a ON a.id=f.asset_id WHERE f.id=? AND (a.path IN (SELECT path FROM hidden) OR in_upload(a.path))", (cover,)).fetchone():
-        cover = (db().execute("SELECT f.id FROM faces f JOIN assets a ON a.id=f.asset_id WHERE f.person_id=? AND a.path NOT IN (SELECT path FROM hidden) AND NOT in_upload(a.path) "
+    if not unlocked() and db().execute("SELECT 1 FROM faces f JOIN assets a ON a.id=f.asset_id WHERE f.id=? AND (a.path IN (SELECT path FROM hidden) OR (a.path >= upl_lo() AND a.path < upl_hi()))", (cover,)).fetchone():
+        cover = (db().execute("SELECT f.id FROM faces f JOIN assets a ON a.id=f.asset_id WHERE f.person_id=? AND a.path NOT IN (SELECT path FROM hidden UNION SELECT v.path FROM live l JOIN assets v ON v.id=l.video_id JOIN assets s ON s.id=l.still_id JOIN hidden h ON h.path=s.path) AND NOT (a.path >= upl_lo() AND a.path < upl_hi()) "
                               "ORDER BY f.w*f.h DESC LIMIT 1", (pid,)).fetchone() or abort(404))["id"]
     return _face_crop(cover)
 
@@ -3654,8 +4041,9 @@ def person_thumbnail(pid):
 @app.get("/api/people")
 def api_people():
     hidden = request.args.get("withHidden") == "true"
-    rows = people_rows() + (people_rows(hidden=True) if hidden else [])
-    nh = len(people_rows(hidden=True))
+    hid = people_rows(hidden=True)  # PH126: once, not twice
+    rows = people_rows() + (hid if hidden else [])
+    nh = len(hid)
     return jsonify(hasNextPage=False, hidden=nh, total=len(rows), people=[_person_dto(r) for r in rows])
 
 
@@ -3666,14 +4054,16 @@ def api_person(pid):
 
 @app.put("/api/people/<pid>")
 def api_person_update(pid):
-    ui_person_update(pid)
+    r = ui_person_update(pid)
+    if isinstance(r, tuple):  # a refusal (bad birthDate) reaches the app as it is
+        return r
     return jsonify(_person_dto(_person(pid)))
 
 
 @app.get("/api/people/<pid>/statistics")
 def api_person_stats(pid):
     _person(pid)
-    n = db().execute("SELECT COUNT(DISTINCT f.asset_id) FROM faces f JOIN assets a ON a.id=f.asset_id WHERE f.person_id=? AND a.path NOT IN (SELECT path FROM hidden) AND NOT in_upload(a.path)", (pid,)).fetchone()[0]
+    n = db().execute("SELECT COUNT(DISTINCT f.asset_id) FROM faces f JOIN assets a ON a.id=f.asset_id WHERE f.person_id=? AND a.path NOT IN (SELECT path FROM hidden UNION SELECT v.path FROM live l JOIN assets v ON v.id=l.video_id JOIN assets s ON s.id=l.still_id JOIN hidden h ON h.path=s.path) AND NOT (a.path >= upl_lo() AND a.path < upl_hi())", (pid,)).fetchone()[0]
     return jsonify(assets=n)
 
 
@@ -3708,7 +4098,17 @@ def _this_month(years_ago, today=None):
 
 
 def _day_sql(days):
-    return "substr(taken,1,10) IN (%s)" % ",".join("?" * len(days))
+    """PH103: the contiguous days (ascending 'YYYY-MM-DD') as an index range on taken, with _day_par(days) as its
+    parameters: a substr() test cannot use the index and read the whole table once per year shown."""
+    return "(taken >= ? AND taken < ?)"
+
+
+def _day_par(days):
+    return [days[0], days[-1] + "~"]  # '~' sorts after every character that follows a date ("T12:00...")
+
+
+def _month_par(ym):
+    return [ym + "-", ym + "."]  # every 'YYYY-MM-...' value and nothing else ('.' follows '-')
 
 
 def geo_pass(limit=100):
@@ -3763,7 +4163,7 @@ def _geo_worker():
 def ui_places():
     rows = db().execute(
         "SELECT g.city, g.cc, MAX(g.region) region, COUNT(*) n, a.id cover, MAX(a.taken) latest FROM geo g JOIN assets a ON a.id=g.asset_id "
-        "WHERE g.city IS NOT NULL AND a.id NOT IN (SELECT video_id FROM live) AND a.path NOT IN (SELECT path FROM hidden) AND NOT in_upload(a.path) GROUP BY g.city, g.cc ORDER BY n DESC, g.city").fetchall()
+        "WHERE g.city IS NOT NULL AND a.id NOT IN (SELECT video_id FROM live) AND a.path NOT IN (SELECT path FROM hidden UNION SELECT v.path FROM live l JOIN assets v ON v.id=l.video_id JOIN assets s ON s.id=l.still_id JOIN hidden h ON h.path=s.path) AND NOT (a.path >= upl_lo() AND a.path < upl_hi()) GROUP BY g.city, g.cc ORDER BY n DESC, g.city").fetchall()
     return jsonify([dict(city=r["city"], cc=r["cc"], region=r["region"], count=r["n"], cover=r["cover"],
                          key=f"{r['city']}|{r['cc']}") for r in rows])
 
@@ -3794,7 +4194,7 @@ def ui_memories():
     for ago, yr, n in _memory_years(days=w):
         _, days = _this_day(ago, window=w)
         cov = db().execute(f"SELECT id FROM assets WHERE {_day_sql(days)} AND {NOT_LIVE_VIDEO} ORDER BY (kind='IMAGE') DESC, taken DESC LIMIT 1",
-                           days).fetchone()
+                           _day_par(days)).fetchone()
         out.append(dict(yearsAgo=ago, year=int(yr), count=n, cover=cov["id"] if cov else None))
     return jsonify(out)
 
@@ -3806,8 +4206,8 @@ def ui_memories_month():
     out = []
     for r in db().execute(f"SELECT substr(taken,1,4) y, COUNT(*) n, MAX(id) cover FROM assets WHERE substr(taken,6,2)=? AND "
                           f"substr(taken,1,4) < ? AND {NOT_LIVE_VIDEO} GROUP BY y ORDER BY y DESC", (mth, _this_month(0)[0])):
-        cov = db().execute(f"SELECT id FROM assets WHERE substr(taken,1,7)=? AND {NOT_LIVE_VIDEO} ORDER BY (kind='IMAGE') DESC, taken DESC LIMIT 1",
-                           (f"{r['y']}-{mth}",)).fetchone()
+        cov = db().execute(f"SELECT id FROM assets WHERE (taken >= ? AND taken < ?) AND {NOT_LIVE_VIDEO} ORDER BY (kind='IMAGE') DESC, taken DESC LIMIT 1",
+                           _month_par(f"{r['y']}-{mth}")).fetchone()
         out.append(dict(yearsAgo=int(_this_month(0)[0]) - int(r["y"]), year=int(r["y"]), month=int(mth), count=r["n"], cover=cov["id"] if cov else None))
     return jsonify(out)
 
@@ -3818,7 +4218,7 @@ def api_memories():
     ctx, out = dto_ctx(), []
     for ago, yr, n in _memory_years():
         _, days = _this_day(ago)
-        rows = db().execute(f"SELECT * FROM assets WHERE {_day_sql(days)} AND {NOT_LIVE_VIDEO} ORDER BY taken LIMIT 200", days).fetchall()
+        rows = db().execute(f"SELECT * FROM assets WHERE {_day_sql(days)} AND {NOT_LIVE_VIDEO} ORDER BY taken LIMIT 200", _day_par(days)).fetchall()
         now = iso(time.time())
         out.append(dict(id=str(uuid.uuid5(NS, f"memory:{yr}:{_this_day(0)[1][MEMORY_DAYS][5:]}")), ownerId=_uid(), type="on_this_day",
                         data=dict(year=int(yr)), isSaved=False, memoryAt=rows[0]["taken"], createdAt=now, updatedAt=now,
@@ -3831,15 +4231,13 @@ def api_memories():
 # current state; when nothing changed, just SyncCompleteV1. The ack carries a fingerprint of the library.
 _sync_acks: dict = {}  # token hash -> {entity type: last ack string}
 _sync_last: dict = {}  # token hash -> (core part, derived part, time of the last full send)
-SYNC_SHAPE = 5  # bump when the entities we send change shape, so phones that already acked the old stream get the new one
+SYNC_SHAPE = 6  # 6: AssetV2 carries the ThumbHash (PH124); bump when the entities we send change shape, so phones that already acked the old stream get the new one
 SYNC_DERIVED_SECS = int(os.environ.get("PHOTOS_SYNC_DERIVED_SECS", "3600"))
 
 
 def _digest(rows):
-    h = hashlib.sha1()
-    for r in rows:
-        h.update(repr(tuple(r)).encode())
-    return h.hexdigest()[:16]
+    """PH126: one hash over the rows' text in one go (it was a repr() and an update() per row)."""
+    return hashlib.sha1("\x1e".join("\x1f".join(map(str, r)) for r in rows).encode()).hexdigest()[:16]
 
 
 def _sync_parts(c):
@@ -3863,11 +4261,17 @@ def _sync_fp(c, th=None):
     """The ack fingerprint. A core change always resends at once; a change in derived data alone (the workers find
     faces and places for hours after a scan) resends at most once per SYNC_DERIVED_SECS, else every app open would
     download the whole library again."""
+    return _sync_fp_parts(c, th)[0]
+
+
+def _sync_fp_parts(c, th=None):
+    """(fingerprint, core, derived): the parts too, so a full send does not compute them twice (PH126)."""
     core, derived = _sync_parts(c)
+    rep_derived = derived
     last = _sync_last.get(th) if th else None
     if last and last[0] == core and last[1] != derived and time.time() - last[2] < SYNC_DERIVED_SECS:
-        derived = last[1]  # keep reporting the state the phone has
-    return hashlib.sha1((core + derived).encode()).hexdigest()[:20]
+        rep_derived = last[1]  # keep reporting the state the phone has
+    return hashlib.sha1((core + rep_derived).encode()).hexdigest()[:20], core, derived
 
 
 def _sync_dupes(c, ok):
@@ -3876,7 +4280,7 @@ def _sync_dupes(c, ok):
     second copy silently deletes the first, and the next exif or album row for it then breaks the whole sync. Only the
     sync response is deduped (files and the web UI are untouched): keep the lowest id, map the others onto it."""
     alias, first = {}, {}
-    for r in c.execute(f"SELECT id, sha1 FROM assets WHERE {ok} AND sha1 IS NOT NULL ORDER BY id"):
+    for r in c.execute(f"SELECT id, sha1 FROM assets WHERE {ok} AND sha1 IS NOT NULL AND sha1 != '' ORDER BY id"):  # '' = unreadable, not a shared hash (PH99)
         if r["sha1"] in first:
             alias[r["id"]] = first[r["sha1"]]
         else:
@@ -3898,9 +4302,9 @@ def _sync_lines(types, fp):
             yield "UserV1", dict(id=uid, email=email, name=user_name(), hasProfileImage=False, profileChangedAt=now, avatarColor=None, deletedAt=None)
         hid = "path IN (SELECT path FROM hidden)"
         clip_of_hidden = f"id IN (SELECT video_id FROM live WHERE still_id IN (SELECT id FROM assets WHERE {hid}))"
-        clip_of_up = "id IN (SELECT video_id FROM live WHERE still_id IN (SELECT id FROM assets WHERE in_upload(path)))"
+        clip_of_up = "id IN (SELECT video_id FROM live WHERE still_id IN (SELECT id FROM assets WHERE (path >= upl_lo() AND path < upl_hi())))"
         # the Hidden album and the PIN-locked upload album (PH72) never reach the phone: their files answer 403 there
-        ok = f"NOT ({hid}) AND NOT ({clip_of_hidden}) AND NOT in_upload(path) AND NOT ({clip_of_up})"
+        ok = f"NOT ({hid}) AND NOT ({clip_of_hidden}) AND NOT (path >= upl_lo() AND path < upl_hi()) AND NOT ({clip_of_up})"
         favs = fav_paths()
         clips = {r[0] for r in c.execute("SELECT video_id FROM live")}
         lives = {r[0]: r[1] for r in c.execute("SELECT still_id, video_id FROM live")}
@@ -3910,6 +4314,7 @@ def _sync_lines(types, fp):
         keep = lambda i: alias.get(i, i)
         lives = {k: keep(v) for k, v in lives.items() if k not in alias}
         if want & {"AssetsV1", "AssetsV2"}:
+            ths = _thumbhashes(c)
             for a in c.execute(f"SELECT * FROM assets WHERE {ok}"):
                 if a["id"] in alias:
                     continue
@@ -3917,7 +4322,7 @@ def _sync_lines(types, fp):
                 yield "AssetV2", dict(id=a["id"], checksum=_checksum(a), createdAt=a["taken"], deletedAt=None, duration=_duration_ms(a), fileCreatedAt=a["taken"],
                                       fileModifiedAt=iso(a["mtime"]), height=a["w"] if turned else a["h"], width=a["h"] if turned else a["w"],
                                       isEdited=False, isFavorite=a["path"] in favs, libraryId=None, livePhotoVideoId=lives.get(a["id"]),
-                                      localDateTime=a["taken"], originalFileName=a["name"], ownerId=uid, stackId=None, thumbhash=None,
+                                      localDateTime=a["taken"], originalFileName=a["name"], ownerId=uid, stackId=None, thumbhash=ths.get(_th_key(a, rots.get(a["id"], 0))),
                                       type=a["kind"], visibility="hidden" if a["id"] in clips else "timeline")
         if "AssetExifsV1" in want:
             for a in c.execute(f"SELECT * FROM assets WHERE {ok}"):
@@ -3949,7 +4354,7 @@ def _sync_lines(types, fp):
             for ago, yr, n in _memory_years(c):
                 _, days = _this_day(ago)
                 rows = c.execute(f"SELECT id, taken FROM assets WHERE {_day_sql(days)} AND {NOT_LIVE_VIDEO} ORDER BY taken LIMIT 200",
-                                 days).fetchall()
+                                 _day_par(days)).fetchall()
                 if not rows:
                     continue
                 mid = str(uuid.uuid5(NS, f"memory:{yr}:{_this_day(0)[1][MEMORY_DAYS][5:]}"))
@@ -3982,14 +4387,15 @@ def _sync_lines(types, fp):
 @app.post("/api/sync/stream")
 def sync_stream():
     b = request.get_json(silent=True) or {}
+    if not isinstance(b.get("types", []), list):  # PH114
+        return err("types must be a list", 400, "Bad Request")
     types, th = [t for t in b.get("types", []) if isinstance(t, str)], _tok_hash()
     app.logger.warning("sync/stream types=%s reset=%s", types, bool(b.get("reset")))  # what the phone app asks for; warning so gunicorn's default level shows it
     c0 = connect()
     try:
-        fp = _sync_fp(c0, th)
+        fp, core, derived = _sync_fp_parts(c0, th)
         unchanged = not b.get("reset") and _sync_acks.get(th, {}).get("SyncCompleteV1") == f"SyncCompleteV1|{fp}"
         if not unchanged:  # a full send: remember what the phone now has
-            core, derived = _sync_parts(c0)
             _sync_last[th] = (core, derived, time.time())
             fp = hashlib.sha1((core + derived).encode()).hexdigest()[:20]
     finally:
@@ -3999,8 +4405,14 @@ def sync_stream():
     def gen():
         if not unchanged:
             yield json.dumps(dict(type="SyncResetV1", data={}, ack=f"SyncResetV1|{fp}")) + "\n"
+            buf = []  # PH126: lines go out in chunks of 500, not one network write per line (30,000 for 10,000 photos)
             for typ, data in _sync_lines(types, fp):
-                yield json.dumps(dict(type=typ, data=data, ack=f"{typ}|{fp}"), separators=(",", ":")) + "\n"
+                buf.append(json.dumps(dict(type=typ, data=data, ack=f"{typ}|{fp}"), separators=(",", ":")))
+                if len(buf) >= 500:
+                    yield "\n".join(buf) + "\n"
+                    buf = []
+            if buf:
+                yield "\n".join(buf) + "\n"
         yield json.dumps(dict(type="SyncCompleteV1", data={}, ack=done)) + "\n"
 
     return Response(stream_with_context(gen()), mimetype="application/jsonlines+json")
@@ -4009,6 +4421,8 @@ def sync_stream():
 @app.post("/api/sync/ack")
 def sync_ack():
     acks = (request.get_json(silent=True) or {}).get("acks", [])
+    if not isinstance(acks, list):  # PH114
+        return err("acks must be a list", 400, "Bad Request")
     app.logger.warning("sync/ack %s", [a.split("|", 1)[0] for a in acks if isinstance(a, str)])  # which entity types the phone says it stored
     store = _sync_acks.setdefault(_tok_hash(), {})
     for a in acks:
@@ -4093,15 +4507,55 @@ def memories_statistics():
 @app.get("/api/stacks")
 @app.get("/api/tags")
 @app.get("/api/shared-links")
-@app.get("/api/map/markers")
 @app.get("/api/search/explore")
 @app.get("/api/search/suggestions")
-@app.get("/api/search/cities")
-@app.get("/api/search/places")
 @app.get("/api/search/person")
 @app.post("/api/search/random")
 def empty_list():
     return jsonify([])
+
+
+@app.get("/api/map/markers")
+def map_markers():
+    """PH126: the phone app's map (it was always empty): every shown photo with GPS, optionally a date range and favorites."""
+    sql, par = (f"SELECT g.asset_id id, g.lat, g.lon, g.city, g.region, g.cc FROM geo g JOIN assets a ON a.id = g.asset_id "
+                f"WHERE g.lat IS NOT NULL AND {NOT_LIVE_VIDEO}"), []
+    for k, op in (("fileCreatedAfter", ">="), ("fileCreatedBefore", "<=")):
+        if request.args.get(k):
+            sql += f" AND a.taken {op} ?"
+            par.append(request.args[k])
+    if request.args.get("isFavorite") == "true":
+        favs = sorted(fav_paths())
+        sql += " AND a.path IN (%s)" % ",".join("?" * len(favs)) if favs else " AND 0"
+        par += favs
+    return jsonify([dict(id=r["id"], lat=r["lat"], lon=r["lon"], city=r["city"], state=r["region"] or None,
+                         country=r["cc"]) for r in db().execute(sql, par)])
+
+
+@app.get("/api/search/cities")
+def search_cities():
+    """PH126: one photo per city (the newest), as the phone's Places row shows them."""
+    ctx = dto_ctx()
+    rows = db().execute(f"SELECT a.*, MAX(a.taken) mt FROM geo g JOIN assets a ON a.id = g.asset_id WHERE g.city IS NOT NULL "
+                        f"AND {NOT_LIVE_VIDEO} GROUP BY g.city, g.cc ORDER BY g.city").fetchall()
+    return jsonify([asset_dto(a, ctx=ctx) for a in rows])
+
+
+@app.get("/api/search/places")
+def search_places():
+    """PH126: cities of the library whose name contains ?name= (the phone's place search)."""
+    q = (request.args.get("name") or "").strip()
+    if not q:
+        return jsonify([])
+    rows = db().execute("SELECT city, MAX(region) region, AVG(lat) lat, AVG(lon) lon FROM geo WHERE city IS NOT NULL "
+                        "AND lat IS NOT NULL AND city LIKE ? ESCAPE '\\' GROUP BY city, cc ORDER BY city LIMIT 50",
+                        ("%" + _like(q) + "%",)).fetchall()
+    return jsonify([dict(name=r["city"], admin1name=r["region"] or "", admin2name="", latitude=r["lat"], longitude=r["lon"]) for r in rows])
+
+
+def _like(v):
+    """A LIKE pattern part that matches v literally (PH126: % and _ are not wildcards)."""
+    return str(v).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _session_dto(r):
@@ -4215,37 +4669,40 @@ def _clip_matrix():
     return _clip_cache[1], _clip_cache[2]
 
 
-_smart_cache: dict = {}  # PH66: (words, clip matrix key, upload folder, hidden count) -> ids; the text model runs once per query
+_smart_cache: dict = {}  # PH66: (words, limit, clip matrix key) -> ranked ids; the text model runs once per query
 
 
 def smart_ids(q, limit=250):
-    """Asset ids that match the words, best first. Hidden photos and the clip half of a Live Photo never match."""
+    """Asset ids that match the words, best first. Hidden photos and the clip half of a Live Photo never match.
+    PH102: only the model's ranking is cached; what may be shown is checked on every call, so a photo hidden (or moved
+    into the upload album) since the last search never comes back from the cache."""
     q = (q or "").strip()[:200]
     if not q or not clipmod.available():
         return []
     ids, m = _clip_matrix()
-    key = (q.lower(), limit, _clip_cache[0] if _clip_cache else None, _upload_prefix(),
-           tuple(db().execute("SELECT COUNT(*), (SELECT COUNT(*) FROM live), (SELECT COUNT(*) FROM assets) FROM hidden").fetchone()))
-    if key in _smart_cache:
-        _smart_cache[key] = _smart_cache.pop(key)  # most recently used last
-        return _smart_cache[key]
-    out = _smart_rank(q, ids, m, limit)
-    _smart_cache[key] = out
+    key = (q.lower(), limit, _clip_cache[0] if _clip_cache else None, len(ids), str(data_dir()))
+    want = _smart_cache.pop(key, None)  # re-inserted below: most recently used last
+    if want is None:
+        want = _smart_rank(q, ids, m, limit)
+    _smart_cache[key] = want
     while len(_smart_cache) > 32:
         _smart_cache.pop(next(iter(_smart_cache)))
-    return out
+    return _shown_ids(want)[:limit]
 
 
 def _smart_rank(q, ids, m, limit):
+    """The model's ranking (2 x limit, for what the filter drops), before any filter."""
     hits = clipmod.rank(m, _clip().words(q), limit=limit * 2)
-    if not hits:
-        return []
-    want = [ids[i] for i, _ in hits]
+    return [ids[i] for i, _ in hits] if hits else []
+
+
+def _shown_ids(want):
+    """want, in order, without what the timeline does not show (hidden, upload album, Live Photo clips, gone)."""
     ok = set()
     for k in range(0, len(want), 500):
         part = want[k:k + 500]
         ok |= {r[0] for r in db().execute(f"SELECT id FROM assets WHERE id IN ({','.join('?' * len(part))}) AND {NOT_LIVE_VIDEO}", part)}
-    return [i for i in want if i in ok][:limit]
+    return [i for i in want if i in ok]
 
 
 @app.get("/ui/search/status")
@@ -4256,13 +4713,16 @@ def ui_search_status():
                    scanned=d.execute("SELECT COUNT(*) FROM clip WHERE asset_id IN (SELECT id FROM assets)").fetchone()[0])
 
 
+MAX_PAGE = 10 ** 9  # PH114: a page past the end is empty; a bigger one overflowed SQLite's OFFSET (a 500)
+
+
 @app.post("/api/search/smart")
 def search_smart():
     b = request.get_json(silent=True) or {}
     try:
         size = min(max(int(b.get("size") or 100), 1), 250)
-        page = max(int(b.get("page") or 1), 1)
-    except (TypeError, ValueError):
+        page = min(max(int(b.get("page") or 1), 1), MAX_PAGE)
+    except (TypeError, ValueError, OverflowError):  # PH114: JSON 1e999 is inf
         return err("size and page must be numbers", 400, "Bad Request")
     ids = smart_ids(str(b.get("query") or ""))
     part = ids[(page - 1) * size:page * size]
@@ -4279,8 +4739,8 @@ def search_metadata():
     b = request.get_json(silent=True) or {}
     sql, par = f"SELECT * FROM assets WHERE {NOT_LIVE_VIDEO}", []
     if b.get("originalFileName"):
-        sql += " AND name LIKE ?"
-        par.append("%" + str(b["originalFileName"]).replace("%", "") + "%")
+        sql += " AND name LIKE ? ESCAPE '\\'"
+        par.append("%" + _like(b["originalFileName"]) + "%")  # PH126: "IMG_1" no longer matches "IMGX1"
     if b.get("type") in ("IMAGE", "VIDEO"):
         sql += " AND kind=?"
         par.append(b["type"])
@@ -4293,9 +4753,12 @@ def search_metadata():
     if b.get("city"):
         sql += " AND id IN (SELECT asset_id FROM geo WHERE city=?)"
         par.append(str(b["city"]))
-    ids = [p for p in b.get("personIds", []) if isinstance(p, str)]
+    ids = b.get("personIds") or []
+    ids = [p for p in ids if isinstance(p, str)] if isinstance(ids, list) else []  # PH109: a number was a 500
     if ids:
-        sql += " AND id IN (SELECT asset_id FROM faces WHERE person_id IN (%s))" % ",".join("?" * len(ids))
+        ids = list(dict.fromkeys(ids))  # PH126: photos with ALL the chosen people, as Immich does (it was any of them)
+        sql += (" AND id IN (SELECT asset_id FROM faces WHERE person_id IN (%s) GROUP BY asset_id HAVING COUNT(DISTINCT person_id) = %d)"
+                % (",".join("?" * len(ids)), len(ids)))
         par += ids
     if b.get("isFavorite") is True:
         favs = sorted(fav_paths())
@@ -4303,8 +4766,8 @@ def search_metadata():
         par += favs
     try:
         size = min(max(int(b.get("size") or 100), 1), 1000)
-        page = max(int(b.get("page") or 1), 1)
-    except (TypeError, ValueError):
+        page = min(max(int(b.get("page") or 1), 1), MAX_PAGE)
+    except (TypeError, ValueError, OverflowError):  # PH114: JSON 1e999 is inf
         return err("size and page must be numbers", 400, "Bad Request")
     total = db().execute(sql.replace("SELECT *", "SELECT COUNT(*)", 1), par).fetchone()[0]
     rows = db().execute(sql + f" ORDER BY taken {'ASC' if b.get('order') == 'asc' else 'DESC'}, id LIMIT ? OFFSET ?", par + [size, (page - 1) * size]).fetchall()

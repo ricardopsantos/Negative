@@ -1,6 +1,11 @@
 # summary: Photos in Docker: loopback port (default 9556) for a reverse proxy with HTTPS in front; every machine-specific value comes from .env (see .env.example).
 # The library is mounted read-write only so Delete can move a photo to the app's trash (restorable for 30 days);
 # nothing else is ever written there. Add :ro to the library volume for a strictly read-only library.
+networks:
+  default:   # PH95: a subnet inside 172.16.0.0/12, the range the app trusts X-Forwarded-For from
+    ipam:
+      config:
+        - subnet: 172.29.93.0/24
 services:
   photos:
     image: ${PHOTOS_IMAGE:-ghcr.io/ricardopsantos/negative:latest}   # ready-built; --build builds from this folder instead

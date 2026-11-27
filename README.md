@@ -100,6 +100,17 @@ python3 -m pytest -q             # needs requirements-dev.txt
 
 Stack: Python, Flask, gunicorn, SQLite, OpenCV, ONNX Runtime, ffmpeg, Docker.
 
+## AI disclosure
+
+Parts of this project were written with the assistance of AI coding agents
+(Claude Code). All changes are reviewed by the maintainer, who is responsible
+for the code. This is the single place that fact is disclosed; it is
+deliberately kept out of the commit history.
+
+## Credits
+
+What Negative builds on, and its relation to Immich: [CREDITS.md](CREDITS.md).
+
 ## License
 
 MIT, see [LICENSE](LICENSE). Third-party parts and their licenses are listed in [THIRD-PARTY.md](THIRD-PARTY.md).

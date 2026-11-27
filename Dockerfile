@@ -22,7 +22,7 @@ RUN cd /app/models \
  && printf '%s  %s\n' 583fd1110a514667812fee7d684952aaf82a99b959760c8d7dca7e0ab9839299 clip_vision_quantized.onnx \
       73baab855d406190da9faa498cfedf65f15cf309f4cc7385b7b032e6d08e5c3a clip_text_quantized.onnx \
       f7f3b7af117d467b58374797691a6438d3e6b9e9cef800dfd5dced7f697a90cd clip_tokenizer.json | sha256sum -c -
-COPY server.py convert.py faces.py places.py clip.py index.html app.js sw.js favicon.png icon-192.png icon-512.png gunicorn.conf.py ./
+COPY server.py convert.py faces.py places.py clip.py thumbhash.py index.html app.js sw.js favicon.png icon-192.png icon-512.png gunicorn.conf.py logfilter.py ./
 # PH77: the map's Leaflet + world outline, served locally (vendor/README.txt)
 COPY vendor/ vendor/
 # the Immich OpenAPI spec (AGPL, so downloaded, not shipped): /api/users/me/preferences builds its answer from it (PH1).

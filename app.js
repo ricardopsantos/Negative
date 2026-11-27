@@ -48,7 +48,7 @@ const tell = (msg, title = "") => dialog({msg, title, cancel: null});
 
 /* theme + size (kept in localStorage) */
 function setTheme(v) { v ? document.documentElement.dataset.theme = v : delete document.documentElement.dataset.theme; localStorage.photos_theme = v; }
-function setSize(v) { localStorage.photos_tile = v; document.documentElement.style.setProperty("--tile", v + "px"); if (typeof layoutPlaceholders === "function" && months.length) layoutPlaceholders(); }
+function setSize(v) { localStorage.photos_tile = v; document.documentElement.style.setProperty("--tile", v + "px"); if (typeof relayout === "function" && months.length) relayout(); }
 setTheme(localStorage.photos_theme || ""); setSize(localStorage.photos_tile || "160");
 
 /* login */
@@ -239,7 +239,7 @@ async function renderMain() {
   if (route.startsWith("place/")) q.set("place", decodeURIComponent(route.slice(6)));
   if (route.startsWith("memory/")) { const [n, d] = route.slice(7).split("/"); q.set("onThisDay", n); if (d) q.set("days", d); }
   if (route.startsWith("month/")) q.set("thisMonth", route.slice(6));
-  if (route.startsWith("spot/")) q.set("bbox", route.slice(5));
+  if (route.startsWith("spot/")) { const [bb, f, t] = route.slice(5).split("/"); q.set("bbox", bb); if (f) q.set("from", f); if (t) q.set("to", t); }
   if (route.startsWith("search/")) q.set("search", decodeURIComponent(route.slice(7)));
   favMode = route === "fav"; if (favMode) q.set("isFavorite", "true");
   await loadFormats(q);
@@ -249,7 +249,7 @@ async function renderMain() {
   q.set("sort", sort); q.set("order", route === "recent" ? "desc" : sortDir);
   const b = await api("/api/timeline/buckets?" + q);
   if (stale()) return;
-  months = b.map(x => ({key: x.timeBucket, count: x.count, label: x.label, loaded: false, q: q.toString()}));
+  months = b.map(x => ({key: x.timeBucket, count: x.count, ratioSum: x.ratio, label: x.label, loaded: false, q: q.toString()}));
   const n = b.reduce((s, x) => s + x.count, 0);
   const where = route.startsWith("album/") ? " in this album" + (isUploadAlbum() ? ": drop photos here to upload them" : "") : favMode ? " in favorites"
     : route === "hidden" ? " hidden" + (hiddenDefaultPin ? " (still the default PIN: change it in Tools)" : "") : route.startsWith("person/") ? " of this person"
@@ -274,7 +274,7 @@ async function renderMain() {
     a.onclick = () => $("m" + i).scrollIntoView(); $("rail").appendChild(a);
   });
   layoutPlaceholders();
-  obs = new IntersectionObserver(es => es.forEach(e => { if (e.isIntersecting) loadMonth(+e.target.dataset.i); }), {root: $("main"), rootMargin: "1200px 0px"});
+  obs = new IntersectionObserver(es => es.forEach(e => { if (e.isIntersecting) loadMonth(+e.target.dataset.i); }), {root: $("main"), rootMargin: "300% 0px"});  // PH118: about three screens read ahead each way
   document.querySelectorAll(".month").forEach(s => obs.observe(s));
 }
 /* PH81: "last scanned N min ago" on the status line */
@@ -288,10 +288,79 @@ function paintStatus() {
 }
 async function refreshScanInfo() { scanInfo = await api("/ui/scan/info").catch(() => null); paintStatus(); }
 setInterval(refreshScanInfo, 60000);
-function layoutPlaceholders() {
+/* PH118: justified rows (each photo at its own shape, rows filled edge to edge) or squares. A month that has not loaded
+   yet reserves the height it will take, from its count and the sum of its photos' shapes, so the scroll bar and the
+   rail stay true while you jump. */
+const justified = () => localStorage.photos_layout !== "square";
+function setLayout(v) { localStorage.photos_layout = v; relayout(); }
+function grid() {
   const w = $("grid").clientWidth - 32, tile = parseInt(getComputedStyle(document.documentElement).getPropertyValue("--tile")) || 160;
-  const cols = mobile() ? 3 : Math.max(1, Math.floor((w + 8) / (tile + 8)));
-  months.forEach((m, i) => { if (!m.loaded) { const t = document.querySelector(`#m${i} .tiles`); if (t) t.style.minHeight = Math.ceil(m.count / cols) * (w / cols) + "px"; } });
+  const box = document.querySelector(".tiles"), gap = box ? parseFloat(getComputedStyle(box).columnGap) || 4 : 4;
+  return {w, tile, gap, cols: mobile() ? 3 : Math.max(1, Math.floor((w + gap) / (tile + gap))), rowH: mobile() ? Math.max(90, tile + 10) : tile};
+}
+const clampR = r => Math.min(3, Math.max(0.4, r || 1));
+function justRows(ratios, w, h, gap) {  // [[start, end, height]]: a row closes when it is as wide as the grid
+  const rows = []; let start = 0, sum = 0;
+  ratios.forEach((r, k) => {
+    sum += clampR(r);
+    const n = k - start + 1;
+    if (sum * h + (n - 1) * gap >= w) { rows.push([start, k + 1, (w - (n - 1) * gap) / sum]); start = k + 1; sum = 0; }
+  });
+  if (start < ratios.length) rows.push([start, ratios.length, h]);
+  return rows;
+}
+function estHeight(m, g) {
+  if (!justified()) return Math.ceil(m.count / g.cols) * ((g.w - (g.cols - 1) * g.gap) / g.cols + g.gap);  // PH126: the gaps count
+  const sum = m.ratioSum || m.count * 1.33;
+  return Math.max(1, Math.ceil(sum * g.rowH / g.w)) * (g.rowH + g.gap);
+}
+function layoutPlaceholders(g = grid()) {
+  months.forEach((m, i) => { if (!m.ids) { const t = document.querySelector(`#m${i} .tiles`); if (t) t.style.minHeight = estHeight(m, g) + "px"; } });
+}
+function layoutMonth(i, g0) {
+  const m = months[i], box = document.querySelector(`#m${i} .tiles`); if (!m || !m.ids || !box) return;
+  const tiles = box.children, just = justified();
+  box.classList.toggle("just", just);
+  if (!just) { for (const t of tiles) t.style.width = t.style.height = ""; return; }
+  const g = g0 || grid();
+  for (const [a, b, h] of justRows(m.ratio, g.w - 1, g.rowH, g.gap))
+    for (let k = a; k < b; k++) if (tiles[k]) { tiles[k].style.width = (clampR(m.ratio[k]) * h).toFixed(2) + "px"; tiles[k].style.height = h.toFixed(2) + "px"; }
+}
+function relayout() { const g = grid(); layoutPlaceholders(g); months.forEach((m, i) => m.ids && layoutMonth(i, g)); }  // PH124: one style read, not one per month
+let resizeT = 0;  // PH118: one layout after the window settles, not one per resize event
+addEventListener("resize", () => { clearTimeout(resizeT); resizeT = setTimeout(() => months.length && relayout(), 120); });
+/* PH117: ThumbHash (github.com/evanw/thumbhash, MIT) to a small data URL: the blurred preview under a tile until its
+   thumbnail has loaded */
+const thCache = new Map();
+function thumbHashURL(b64) {
+  if (!b64) return "";
+  if (thCache.has(b64)) return thCache.get(b64);
+  let url = "";
+  try {
+    const hash = Uint8Array.from(atob(b64), c => c.charCodeAt(0)), {PI, min, max, cos, round} = Math;
+    const h24 = hash[0] | (hash[1] << 8) | (hash[2] << 16), h16 = hash[3] | (hash[4] << 8);
+    const l_dc = (h24 & 63) / 63, p_dc = ((h24 >> 6) & 63) / 31.5 - 1, q_dc = ((h24 >> 12) & 63) / 31.5 - 1;
+    const l_scale = ((h24 >> 18) & 31) / 31, alpha = h24 >> 23, p_scale = ((h16 >> 3) & 63) / 63, q_scale = ((h16 >> 9) & 63) / 63;
+    const land = h16 >> 15, lx = max(3, land ? (alpha ? 5 : 7) : h16 & 7), ly = max(3, land ? h16 & 7 : (alpha ? 5 : 7));
+    let idx = 0; const start = alpha ? 6 : 5;
+    const chan = (nx, ny, scale) => { const ac = []; for (let cy = 0; cy < ny; cy++) for (let cx = cy ? 0 : 1; cx * ny < nx * (ny - cy); cx++) { ac.push((((hash[start + (idx >> 1)] >> ((idx & 1) << 2)) & 15) / 7.5 - 1) * scale); idx++; } return ac; };
+    const l_ac = chan(lx, ly, l_scale), p_ac = chan(3, 3, p_scale * 1.25), q_ac = chan(3, 3, q_scale * 1.25);
+    const rw = land ? (alpha ? 5 : 7) : h16 & 7, rh = land ? h16 & 7 : (alpha ? 5 : 7), ratio = rw / rh, w = round(ratio > 1 ? 32 : 32 * ratio), h = round(ratio > 1 ? 32 / ratio : 32);
+    const cv = document.createElement("canvas"); cv.width = w; cv.height = h;
+    const ctx = cv.getContext("2d"), img = ctx.createImageData(w, h), px = img.data, fx = [], fy = [];
+    for (let y = 0, i = 0; y < h; y++) for (let x = 0; x < w; x++, i += 4) {
+      let l = l_dc, p = p_dc, q = q_dc;
+      for (let cx = 0; cx < max(lx, 3); cx++) fx[cx] = cos(PI / w * (x + 0.5) * cx);
+      for (let cy = 0; cy < max(ly, 3); cy++) fy[cy] = cos(PI / h * (y + 0.5) * cy);
+      for (let cy = 0, j = 0; cy < ly; cy++) for (let cx = cy ? 0 : 1, f2 = fy[cy] * 2; cx * ly < lx * (ly - cy); cx++, j++) l += l_ac[j] * fx[cx] * f2;
+      for (let cy = 0, j = 0; cy < 3; cy++) for (let cx = cy ? 0 : 1, f2 = fy[cy] * 2; cx < 3 - cy; cx++, j++) { const f = fx[cx] * f2; p += p_ac[j] * f; q += q_ac[j] * f; }
+      const b = l - 2 / 3 * p, r = (3 * l - b + q) / 2, g = r - q;
+      px[i] = max(0, 255 * min(1, r)); px[i + 1] = max(0, 255 * min(1, g)); px[i + 2] = max(0, 255 * min(1, b)); px[i + 3] = 255;
+    }
+    ctx.putImageData(img, 0, 0); url = cv.toDataURL();
+  } catch (e) { url = ""; }
+  if (thCache.size >= 3000) thCache.delete(thCache.keys().next().value);  // PH125: the oldest one goes, not the 3,000 being scrolled
+  thCache.set(b64, url); return url;
 }
 /* One request per month at a time: callers share the in-flight promise. A failure is not retried in a loop; the month
    is tried again only when it scrolls into view again (the observer), at most once every 5 seconds. */
@@ -309,10 +378,18 @@ async function fillMonth(i, m) {
   let c;
   try { c = await api("/api/timeline/bucket?" + q); } catch (e) { m.loaded = false; m.failedAt = Date.now(); return; }
   if (months[i] !== m) return;  // the view changed while this was loading: drop the stale answer
-  m.ids = c.id; m.fav = c.isFavorite; m.img = c.isImage; m.rot = c.rotation || c.id.map(() => 0); m.live = c.livePhotoVideoId || c.id.map(() => null);
-  m.names = c.fileName || c.id.map(() => ""); m.dates = c.fileCreatedAt || [];
+  m.ids = c.id; m.fav = c.isFavorite; m.img = c.isImage; m.rot = c.rotation || c.id.map(() => 0); m.ver = c.ver || c.id.map(() => ""); m.live = c.livePhotoVideoId || c.id.map(() => null);
+  m.names = c.fileName || c.id.map(() => ""); m.dates = c.fileCreatedAt || []; m.ratio = c.ratio || c.id.map(() => 1); m.th = c.thumbhash || [];
   const box = document.querySelector(`#m${i} .tiles`); box.style.minHeight = "";
-  box.innerHTML = c.id.map((id, k) => `<button class="tile${picked.has(id) ? " sel" : ""}" data-i="${i}" data-k="${k}" data-id="${id}" data-video="${c.isImage[k] ? 0 : 1}" role="gridcell" aria-label="${esc((c.isImage[k] ? "Photo " : "Video ") + (m.names[k] || "") + ", " + fmtDay(m.dates[k]))}${c.isFavorite[k] ? ", favorite" : ""}"><img loading="lazy" decoding="async" src="/api/assets/${id}/thumbnail?v=${m.rot[k]}" alt="">${c.isImage[k] ? (m.live[k] ? '<span class="badge" title="Live Photo">LIVE</span>' : "") : '<span class="badge">&#9654;</span>'}${c.isFavorite[k] ? '<span class="star">&#9733;</span>' : ""}</button>`).join("");
+  box.innerHTML = c.id.map((id, k) => `<button class="tile${picked.has(id) ? " sel" : ""}" data-i="${i}" data-k="${k}" data-id="${id}" data-video="${c.isImage[k] ? 0 : 1}" role="gridcell" aria-label="${esc((c.isImage[k] ? "Photo " : "Video ") + (m.names[k] || "") + ", " + fmtDay(m.dates[k]))}${c.isFavorite[k] ? ", favorite" : ""}"><img loading="lazy" decoding="async" src="/api/assets/${id}/thumbnail?v=${m.rot[k]}.${m.ver[k]}" alt="">${c.isImage[k] ? (m.live[k] ? '<span class="badge" title="Live Photo">LIVE</span>' : "") : '<span class="badge">&#9654;</span>'}${c.isFavorite[k] ? '<span class="star">&#9733;</span>' : ""}</button>`).join("");
+  [...box.children].forEach((t, k) => {  // PH117: the blur shows until the thumbnail paints over it
+    const img = t.querySelector("img");
+    if (!m.th[k] || (img && img.complete && img.naturalWidth)) return;  // PH124: already painted from the cache: no decode
+    const u = thumbHashURL(m.th[k]); if (!u) return;
+    t.style.backgroundImage = `url(${u})`;
+    if (img) img.addEventListener("load", () => { t.style.backgroundImage = ""; }, {once: true});
+  });
+  layoutMonth(i);
 }
 /* right-click (or long press on a phone, PH86) a thumbnail: the same actions as the viewer, without opening it */
 let ctxEl = null;
@@ -380,8 +457,20 @@ $("grid").addEventListener("click", async e => {
   } else if (picked.has(t.dataset.id)) picked.delete(t.dataset.id); else picked.add(t.dataset.id);
   lastPick = t; paintSel();
 });
+/* PH122: "." on a focused tile toggles its favorite without opening it */
+async function favTile(t) {
+  const i = +t.dataset.i, k = +t.dataset.k, m = months[i]; if (!m || !m.ids) return;
+  const on = !m.fav[k];
+  try { await post("/ui/favorite", {id: m.ids[k], favorite: on}); } catch (x) { tell("The favorite could not be saved: " + x.message); return; }
+  m.fav[k] = on; const st = t.querySelector(".star");
+  if (on && !st) t.insertAdjacentHTML("beforeend", '<span class="star">&#9733;</span>'); else if (!on && st) st.remove();
+  toast(on ? "Added to favorites" : "Removed from favorites");
+  loadAlbums();  // PH125: the sidebar's Favorites number, as the viewer's star does
+  if (favMode && !on) { const y = $("main").scrollTop; await render(); $("main").scrollTop = y; }  // it leaves the Favorites view
+}
 /* PH86: arrow keys move between tiles (up/down by a row), Enter opens */
 $("grid").addEventListener("keydown", e => {
+  if (e.key === "." && !e.ctrlKey && !e.metaKey && !e.altKey) { const f = e.target.closest(".tile[data-id]"); if (f) { e.preventDefault(); favTile(f); } return; }
   const t = e.target.closest(".tile[data-id]"); if (!t || !["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(e.key)) return;
   const all = [...document.querySelectorAll(".tile[data-id]")], i = all.indexOf(t);
   let j = i;
@@ -415,7 +504,7 @@ async function showPeople(id) {
   const fc = await api(`/ui/assets/${id}/faces`).catch(() => []);
   if (pplFor !== id) return;
   const seen = new Set(), named = fc.filter(f => f.name && f.personId && !seen.has(f.personId) && seen.add(f.personId));
-  box.innerHTML = named.map(f => `<button data-go="${f.personId}" title="All photos of ${esc(f.name)} (long press: more)"><img src="/ui/faces/${f.faceId}/crop" alt="">${esc(f.name)}</button>`).join("");
+  box.innerHTML = named.map(f => `<button data-go="${f.personId}" title="All photos of ${esc(f.name)} (long press: more)"><img src="/ui/faces/${f.faceId}/crop" alt="">${esc(f.name)}${(a => a === null ? "" : `<span class="age">, ${ageTxt(a)}</span>`)(ageAt(f.birth, pos && pos.id === id && months[pos.i] ? months[pos.i].dates[pos.k] : null))}</button>`).join("");
   box.hidden = !named.length;
   box.querySelectorAll("button[data-go]").forEach(b => {
     let timer = 0, held = false;
@@ -488,7 +577,7 @@ function viewerImg() {
   zoom = null;
   if (!m.img[p.k]) { const v = document.createElement("video"); v.controls = v.autoplay = true; v.playsInline = true; $("stage").replaceChildren(v); playVideo(v, p.id, true); if (slides) v.addEventListener("ended", slideNext, {once: true}); return; }
   const q = fullSize ? "size=full" : "size=preview";
-  $("stage").innerHTML = `<img src="/api/assets/${p.id}/thumbnail?${q}&v=${m.rot[p.k]}" alt="${esc(m.names?.[p.k] || "")}">`;
+  $("stage").innerHTML = `<img src="/api/assets/${p.id}/thumbnail?${q}&v=${m.rot[p.k]}.${m.ver[p.k]}" alt="${esc(m.names?.[p.k] || "")}">`;
   $("viewer").classList.toggle("full", fullSize); $("vfit").textContent = fullSize ? "Fit" : "Full size";
 }
 function photoOpen() { return !!(pos && pos.a && ($("viewer").open || pos.ctx)); }  // the open photo, or the one last right-clicked
@@ -506,7 +595,7 @@ async function openViewer(i, k) {
   $("vhid").textContent = route === "hidden" ? "Unhide" : "Hide";
   if (!$("viewer").open) $("viewer").showModal();
   if (slides) slideArm();
-  const nx = await at(p.i, p.k + 1); if (nx && months[nx.i].img[nx.k]) new Image().src = `/api/assets/${nx.id}/thumbnail?size=preview&v=${months[nx.i].rot[nx.k]}`;
+  const nx = await at(p.i, p.k + 1); if (nx && months[nx.i].img[nx.k]) new Image().src = `/api/assets/${nx.id}/thumbnail?size=preview&v=${months[nx.i].rot[nx.k]}.${months[nx.i].ver[nx.k]}`;
 }
 /* Play the original first (HEVC included: Safari and most Chrome builds play it). Only if this browser cannot decode
    it, ask the server for an H.264 copy, made in the background, and poll until it is ready. */
@@ -588,8 +677,10 @@ async function rotate(dir) {
   const m = months[pos.i];
   try {
     const r = await post("/ui/rotate", {id: pos.id, direction: dir});
-    m.rot[pos.k] = r.rotation; viewerImg();
-    const t = document.querySelector(`.tile[data-i="${pos.i}"][data-k="${pos.k}"] img`); if (t) t.src = `/api/assets/${pos.id}/thumbnail?v=${r.rotation}`;
+    const was = m.rot[pos.k]; m.rot[pos.k] = r.rotation; viewerImg();
+    if ((was - r.rotation) % 180 && m.ratio) { m.ratio[pos.k] = 1 / clampR(m.ratio[pos.k]); layoutMonth(pos.i); }  // PH126: a turned photo takes its new shape
+    const tb = document.querySelector(`.tile[data-i="${pos.i}"][data-k="${pos.k}"]`); if (tb) tb.style.backgroundImage = "";
+    const t = document.querySelector(`.tile[data-i="${pos.i}"][data-k="${pos.k}"] img`); if (t) t.src = `/api/assets/${pos.id}/thumbnail?v=${r.rotation}.${m.ver[pos.k]}`;
     pos.a = await api("/api/assets/" + pos.id).catch(() => pos.a);
   } catch (e) { tell(e.message); }
 }
@@ -610,6 +701,7 @@ document.addEventListener("keydown", e => {
   if (e.key === "t" || e.key === "T") startTag();
   if (e.key === "l" || e.key === "L") $("vlive").click();
   if (e.key === "s" || e.key === "S") slides ? stopSlides() : startSlides();
+  if (e.key === ".") $("vfav").click();  // PH122: "." toggles favorite, as in the grid
   if (e.key === " " && slides) { e.preventDefault(); pauseSlides(); }
 });
 /* PH86 (IMPROVE 3): swipe left/right = next/previous, swipe down = close; pinch or double-tap to zoom, drag to pan */
@@ -797,7 +889,7 @@ function startSlides() {
     slides = {paused: false, shuffle: localStorage.photos_shuffle === "1", timer: 0};
     $("slide").hidden = false; $("slidedelay").value = String(slideDelay()); paintSlide();
     $("viewer").requestFullscreen?.().catch(() => {});
-    slideArm();
+    slideIdle(); slideArm();
   };
   begin();
 }
@@ -820,8 +912,12 @@ async function slideNext() {
   } else p = await at(pos.i, pos.k + 1) || await at(0, 0);  // at the end: from the start again
   if (slides && p) openViewer(p.i, p.k);
 }
-function pauseSlides() { if (!slides) return; slides.paused = !slides.paused; paintSlide(); slides.paused ? clearTimeout(slides.timer) : slideNext(); }
-function stopSlides() { if (!slides) return; clearTimeout(slides.timer); slides = null; $("slide").hidden = true; if (document.fullscreenElement) document.exitFullscreen().catch(() => {}); }
+function pauseSlides() { if (!slides) return; slides.paused = !slides.paused; paintSlide(); slideIdle(); slides.paused ? clearTimeout(slides.timer) : slideNext(); }
+/* PH123: in a slideshow the controls fade after 2.5 s without a mouse move, tap or key, and come back on the next */
+let idleT = 0;
+function slideIdle() { $("viewer").classList.remove("idle"); clearTimeout(idleT); if (slides && !slides.paused) idleT = setTimeout(() => slides && !slides.paused && $("viewer").classList.add("idle"), 2500); }  // PH125: paused, the controls stay
+for (const ev of ["mousemove", "pointerdown", "keydown"]) $("viewer").addEventListener(ev, () => slides && slideIdle());
+function stopSlides() { if (!slides) return; clearTimeout(slides.timer); clearTimeout(idleT); $("viewer").classList.remove("idle"); slides = null; $("slide").hidden = true; if (document.fullscreenElement) document.exitFullscreen().catch(() => {}); }
 $("slidedelay").onchange = e => { localStorage.photos_slide = e.target.value; slideArm(); };
 $("slideshuf").onclick = () => { if (!slides) return; slides.shuffle = !slides.shuffle; localStorage.photos_shuffle = slides.shuffle ? "1" : "0"; paintSlide(); };
 $("slidepause").onclick = pauseSlides;
@@ -880,7 +976,7 @@ async function renderExplore() {
   const gen = renderGen;
   setStatus("Explore");
   const days = +(localStorage.photos_memdays || 3);
-  const [ppl, pl, mem, mon, st] = await Promise.all([api("/ui/people").catch(() => []), api("/ui/places").catch(() => []), api("/ui/memories?days=" + days).catch(() => []),
+  const [ppl, pl, mem, mon, st] = await Promise.all([api("/ui/people?limit=14").catch(() => []), api("/ui/places").catch(() => []), api("/ui/memories?days=" + days).catch(() => []),
     api("/ui/memories/month").catch(() => []), api("/ui/faces/status").catch(() => null)]);
   if (gen !== renderGen) return;
   const sec = (title, more, body) => `<section class="xsec"><div class="xhead"><h3>${title}</h3>${more || ""}</div>${body}</section>`;
@@ -917,9 +1013,11 @@ function loadLeaflet() {
   ["/vendor/leaflet.css", "/vendor/MarkerCluster.css", "/vendor/MarkerCluster.Default.css"].forEach(css);
   return leafletP = js("/vendor/leaflet.js").then(() => js("/vendor/leaflet.markercluster.js"));
 }
+/* PH125: the map's date range travels with "Open these photos" (spot/<bbox>/<from>/<to>) */
+const mapRange = () => { const f = $("mapfrom"), t = $("mapto"); return f && t && (f.value || t.value) ? `/${f.value}/${t.value}` : ""; };
 async function renderMap() {
   const gen = renderGen;
-  $("grid").innerHTML = '<div class="pbar"><b>Map</b><span class="path" id="mapst">Loading...</span></div><div id="map"></div>';
+  $("grid").innerHTML = '<div class="pbar"><b>Map</b><span class="path" id="mapst">Loading...</span><span id="mapdates"><label>From <input type="date" id="mapfrom"></label> <label>to <input type="date" id="mapto"></label> <button id="mapall">All dates</button></span></div><div id="map"></div>';
   try { await loadLeaflet(); } catch (e) { $("mapst").textContent = "The map could not be loaded."; return; }
   const [pts, world] = await Promise.all([api("/ui/map"), fetch("/vendor/world.json").then(r => r.json())]);
   if (gen !== renderGen) return;
@@ -932,12 +1030,22 @@ async function renderMap() {
   L.geoJSON(world, {interactive: false, style: {color: dark ? "#6b7380" : "#8c8f94", weight: 0.7, fillColor: dark ? "#3a3f47" : "#f2efe9", fillOpacity: 1}}).addTo(map);
   const cl = L.markerClusterGroup({chunkedLoading: true, showCoverageOnHover: false, maxClusterRadius: 50, zoomToBoundsOnClick: false});
   const icon = L.divIcon({className: "", html: '<div class="mapdot"></div>', iconSize: [12, 12]});
-  const ms = pts.id.map((id, i) => { const m = L.marker([pts.lat[i], pts.lon[i]], {icon}); m.pid = id; return m; });
+  const ms = pts.id.map((id, i) => { const m = L.marker([pts.lat[i], pts.lon[i]], {icon}); m.pid = id; m.day = (pts.day || [])[i] || ""; return m; });
   cl.addLayers(ms); map.addLayer(cl);
+  /* PH120: from / to dates; the pins outside the range leave the map */
+  const days = ms.map(m => m.day).filter(Boolean).sort(), fr = $("mapfrom"), to = $("mapto");
+  if (days.length) { fr.min = to.min = days[0]; fr.max = to.max = days[days.length - 1]; } else $("mapdates").hidden = true;
+  const filt = () => {
+    if (fr.value && to.value && fr.value > to.value) [fr.value, to.value] = [to.value, fr.value];  // PH125: a reversed range is the same range
+    const a = fr.value, b = to.value, keep = ms.filter(m => (!a || (m.day && m.day >= a)) && (!b || (m.day && m.day <= b)));
+    cl.clearLayers(); cl.addLayers(keep);
+    $("mapst").textContent = `${keep.length.toLocaleString()} of ${ms.length.toLocaleString()} photos. Click a group to see its photos.`;
+  };
+  fr.onchange = to.onchange = filt; $("mapall").onclick = () => { fr.value = to.value = ""; filt(); };
   const pop = (latlng, ids, b) => {
     const pad = 0.0005, bbox = [b.getSouth() - pad, b.getWest() - pad, b.getNorth() + pad, b.getEast() + pad].map(v => v.toFixed(5)).join(",");
     const div = document.createElement("div"); div.className = "mappop";
-    div.innerHTML = `<img src="/api/assets/${ids[0]}/thumbnail" alt=""><b>${ids.length.toLocaleString()} photo${ids.length > 1 ? "s" : ""}</b><br><a href="#/spot/${bbox}">Open ${ids.length > 1 ? "these photos" : "this photo"}</a>`;
+    div.innerHTML = `<img src="/api/assets/${ids[0]}/thumbnail" alt=""><b>${ids.length.toLocaleString()} photo${ids.length > 1 ? "s" : ""}</b><br><a href="#/spot/${bbox}${mapRange()}">Open ${ids.length > 1 ? "these photos" : "this photo"}</a>`;
     L.popup().setLatLng(latlng).setContent(div).openOn(map);
   };
   cl.on("clusterclick", e => { const kids = e.layer.getAllChildMarkers(); pop(e.layer.getLatLng(), kids.map(m => m.pid), e.layer.getBounds()); });
@@ -973,10 +1081,21 @@ async function renderStats() {
 }
 
 /* people (PH83: keeps the scroll position, filter by name, several suggestions at once, hide the small unnamed groups) */
-let peopleTimer = null, showHiddenPeople = false, peopleQ = "";
+let peopleTimer = null, showHiddenPeople = false, peopleFav = false, peopleQ = "";
+/* PH121: age on a given day from a birthday ("YYYY-MM-DD"), or null */
+function ageAt(birth, iso) {
+  if (!birth || !iso) return null;
+  const b = new Date(birth + "T00:00:00"), d = new Date(String(iso).slice(0, 10) + "T00:00:00");
+  if (isNaN(b) || isNaN(d) || d < b) return null;
+  let a = d.getFullYear() - b.getFullYear();
+  if (d.getMonth() < b.getMonth() || (d.getMonth() === b.getMonth() && d.getDate() < b.getDate())) a--;
+  return a;
+}
+const localDay = (d = new Date()) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;  // PH125: today here, not in UTC
+const ageTxt = a => a === null ? "" : a === 0 ? "under 1 year" : a + (a === 1 ? " year" : " years");  // PH124: "under 1 year old", never "under 1 old"
 async function renderPeople(refresh = false) {
   const gen = renderGen;
-  const [ppl, st] = await Promise.all([api("/ui/people" + (showHiddenPeople ? "?hidden=1" : "")), api("/ui/faces/status").catch(() => null)]);
+  const [ppl, st] = await Promise.all([api("/ui/people" + (showHiddenPeople ? "?hidden=1" : peopleFav ? "?fav=1" : "")), api("/ui/faces/status").catch(() => null)]);
   if (gen !== renderGen) return;
   const scanning = st && st.enabled && st.scanned < st.photos;
   setStatus(ppl.length + " people" + (st ? ` | faces found in ${st.scanned.toLocaleString()} of ${st.photos.toLocaleString()} photos` + (scanning ? " (still looking...)" : "") : "") + (st && !st.enabled ? " | face detection is off" : ""));
@@ -984,16 +1103,18 @@ async function renderPeople(refresh = false) {
   const y = $("main").scrollTop;
   if (refresh && (y > 0 || document.activeElement.closest("#grid") || $("grid").querySelector(".sg input:checked"))) return;  // PH86: no jump to the top while you work
   const q = peopleQ.toLowerCase(), shown = ppl.filter(p => !q || (p.name || "unnamed").toLowerCase().includes(q));
-  $("grid").innerHTML = `<div class="pbar"><input id="pq" type="search" placeholder="Filter by name" aria-label="Filter people by name" value="${esc(peopleQ)}"><button id="phid">${showHiddenPeople ? "Show people" : "Show hidden"}</button>${showHiddenPeople ? "" : '<button id="psmall">Hide small unnamed groups...</button>'}</div>` +
+  $("grid").innerHTML = `<div class="pbar"><input id="pq" type="search" placeholder="Filter by name" aria-label="Filter people by name" value="${esc(peopleQ)}"><span class="seg" role="group" aria-label="Show"><button id="pall" aria-pressed="${!showHiddenPeople && !peopleFav}">All</button><button id="pfavs" aria-pressed="${peopleFav}">Favorites</button><button id="phid" aria-pressed="${showHiddenPeople}">Hidden</button></span>${showHiddenPeople ? "" : '<button id="psmall">Hide small unnamed groups...</button>'}</div>` +
     (shown.length ? '<div class="people">' + shown.map(p => `<div class="pcard"><img data-p="${p.id}" loading="lazy" src="/ui/people/${p.id}/thumbnail" alt="${esc(p.name || "Unnamed")}"><input data-n="${p.id}" value="${esc(p.name)}" placeholder="Add a name" aria-label="Name"><div class="path">${p.count} photo${p.count === 1 ? "" : "s"}</div><button data-h="${p.id}">${showHiddenPeople ? "Show again" : "Don't show more"}</button></div>`).join("") + "</div>"
       : '<div class="empty">' + (q ? "Nobody matches that name." : scanning ? "Looking for faces. People appear here as photos are scanned." : "No people yet. Faces seen in at least 3 photos, or that you name, are listed.") + "</div>");
   $("pq").oninput = e => { peopleQ = e.target.value; const c = e.target.selectionStart; renderPeople().then(() => { $("pq").focus(); $("pq").setSelectionRange(c, c); }); };
-  $("phid").onclick = () => { showHiddenPeople = !showHiddenPeople; renderPeople(); };
+  $("pall").onclick = () => { showHiddenPeople = peopleFav = false; renderPeople(); };
+  $("pfavs").onclick = () => { showHiddenPeople = false; peopleFav = true; renderPeople(); };
+  $("phid").onclick = () => { showHiddenPeople = true; peopleFav = false; renderPeople(); };
   if ($("psmall")) $("psmall").onclick = hideSmall;
   $("grid").querySelectorAll("img[data-p]").forEach(i => i.onclick = () => go("person/" + i.dataset.p));
   $("grid").querySelectorAll("button[data-h]").forEach(b => b.onclick = () => { const pr = ppl.find(x => x.id === b.dataset.h); hidePerson(b.dataset.h, pr ? pr.name : "", !showHiddenPeople, () => renderPeople().then(() => { $("main").scrollTop = y; })); });
   $("grid").querySelectorAll("input[data-n]").forEach(i => { i.dataset.old = i.value; i.onchange = () => { i.blur(); renamePerson(i.dataset.n, i.dataset.old, i, null); }; });
-  if (!showHiddenPeople && !q) await suggestions(ppl);
+  if (!showHiddenPeople && !peopleFav && !q) await suggestions(ppl);
   $("main").scrollTop = y;
 }
 async function hideSmall() {
@@ -1010,6 +1131,14 @@ async function personBar() {
   const bar = document.createElement("div"); bar.className = "pbar";
   bar.innerHTML = `<button id="pback">&larr; People</button><img class="pface" src="/ui/people/${id}/thumbnail" alt=""><input id="pname" value="${esc(me ? me.name : "")}" placeholder="Add a name" aria-label="Name"><select id="pmerge" aria-label="Merge into"><option value="">Same person as...</option>${all.filter(p => p.id !== id).map(p => `<option value="${p.id}">${esc(p.name || "Unnamed")} (${p.count})</option>`).join("")}</select><button id="phide">Don't show more</button><button id="pcheck">Check faces</button>`;
   $("grid").prepend(bar);
+  /* PH121: favorite and birthday */
+  const extra = document.createElement("span"); extra.className = "pextra";
+  extra.innerHTML = `<button id="pfav" aria-pressed="${!!(me && me.fav)}" title="Favorite person">${me && me.fav ? "&#9733; Favorite" : "&#9734; Favorite"}</button><label>Birthday <input type="date" id="pbirth" value="${esc(me && me.birth || "")}" max="${localDay()}"></label><span class="path" id="page"></span>`;
+  bar.appendChild(extra);
+  const paintAge = () => { const a = ageAt($("pbirth").value, localDay()); $("page").textContent = a === null ? "" : ageTxt(a) + " old"; };
+  paintAge();
+  $("pfav").onclick = async () => { const on = $("pfav").getAttribute("aria-pressed") !== "true"; try { await put(`/ui/people/${id}`, {isFavorite: on}); $("pfav").setAttribute("aria-pressed", on); $("pfav").innerHTML = (on ? "&#9733;" : "&#9734;") + " Favorite"; } catch (x) { tell(x.message); } };
+  $("pbirth").onchange = async e => { try { await put(`/ui/people/${id}`, {birthDate: e.target.value || null}); paintAge(); } catch (x) { tell(x.message); } };
   $("pback").onclick = () => go("people");
   $("pname").dataset.old = $("pname").value;
   $("pname").onchange = e => renamePerson(id, e.target.dataset.old, e.target, null);
@@ -1072,8 +1201,9 @@ function moreTrash() {  // 120 at a time as you scroll, not every thumbnail at o
   const box = $("ttiles"); if (!box || trashShown >= trashItems.length) return;
   const part = trashItems.slice(trashShown, trashShown + 120); trashShown += part.length;
   box.insertAdjacentHTML("beforeend", part.map(x => `<div class="trashitem" data-t="${x.id}"><input type="checkbox" aria-label="Select ${esc(x.name)}"><div class="tile" style="cursor:default" data-video="${x.kind === "VIDEO" ? 1 : 0}"><img loading="lazy" src="/ui/trash/${x.id}/thumbnail" alt=""></div><div class="path" style="margin:4px 0">${esc(x.name)}<br>deleted ${fmtDay(x.deleted)}, ${x.daysLeft} days left</div><button data-r style="width:100%">Restore</button></div>`).join(""));
+  const byId = new Map(part.map(x => [x.id, x]));  // PH126: one lookup per item, not a scan of the whole trash
   box.querySelectorAll(".trashitem:not([data-w])").forEach(el => {
-    el.dataset.w = 1; const id = el.dataset.t, it = trashItems.find(x => x.id === id);
+    el.dataset.w = 1; const id = el.dataset.t, it = byId.get(id);
     el.querySelector("input").onchange = e => { e.target.checked ? tpicked.add(id) : tpicked.delete(id); el.classList.toggle("sel", e.target.checked); paintTrashBar(); };
     el.querySelector("[data-r]").onclick = () => restoreOne(it);
   });
@@ -1182,7 +1312,11 @@ function paintUp() {
 }
 $("upcancel").onclick = () => { if (!upRun) return; upRun.cancelled = true; upQ.length = 0; upRun.xhrs.forEach(x => x.abort()); };
 async function finishUp() {
-  const r = upRun; upRun = null; $("upbar").hidden = true; $("upfiles").value = "";
+  if (upQ.length && upRun && !upRun.cancelled) {  // PH126: files added as the last upload ended: send them too, not drop them
+    const run = upRun, worker = async () => { while (upQ.length && !run.cancelled) await sendOne(upQ.shift()); };
+    return Promise.all([worker(), worker(), worker()]).then(finishUp);
+  }
+  const r = upRun; upRun = null; upQ.length = 0; $("upbar").hidden = true; $("upfiles").value = "";
   await loadAlbums(); await render();
   uploadToast(r.saved, r.dup, r.failed, r.cancelled);
 }
@@ -1282,7 +1416,8 @@ const MENUS = () => [
     {l: "Ascending", run: () => { closeViewer(); setSort(curSort(), "asc"); }, chk: () => sortDir === "asc"}, {l: "Descending", run: () => { closeViewer(); setSort(curSort(), "desc"); }, chk: () => sortDir === "desc"},
     "-", {l: "Fit to screen", k: "F", run: () => setFit(false), on: photoOpen, chk: () => !fullSize}, {l: "Full size", k: "F", run: () => setFit(true), on: photoOpen, chk: () => fullSize},
     {l: "Play Live Photos automatically (after 3 s)", run: () => { localStorage.photos_liveauto = liveAuto() ? "0" : "1"; }, chk: liveAuto},
-    "-", ...[["Small thumbnails", "100"], ["Medium thumbnails", "160"], ["Large thumbnails", "240"]].map(([l, v]) => ({l, run: () => setSize(v), chk: () => (localStorage.photos_tile || "160") === v})),
+    "-", {l: "Photos in their own shape", run: () => setLayout("justified"), chk: () => justified()}, {l: "Square tiles", run: () => setLayout("square"), chk: () => !justified()},
+    ...[["Small thumbnails", "100"], ["Medium thumbnails", "160"], ["Large thumbnails", "240"]].map(([l, v]) => ({l, run: () => setSize(v), chk: () => (localStorage.photos_tile || "160") === v})),
     "-", ...[["System theme", ""], ["Light theme", "light"], ["Dark theme", "dark"]].map(([l, v]) => ({l, run: () => setTheme(v), chk: () => (localStorage.photos_theme || "") === v}))]],
   ["Tools", [
     {l: "Select photos", run: toggleSelMode, chk: () => selMode},
